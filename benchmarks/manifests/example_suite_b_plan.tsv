@@ -1,0 +1,5 @@
+#graph_id	family	n	parameter	topology_seed	weight_seed	weight_max	require_connected	enabled	notes
+small_er	er	100	12	101	201	1000	1	1	manifest test
+small_ba	ba	100	4	102	202	1000	1	1	manifest test
+small_clique	clique_blocks	96	16	0	203	1000	0	1	manifest test
+small_biclique	biclique_blocks	96	8	0	204	1000	0	1	manifest test
