@@ -1,0 +1,17 @@
+/build/
+/build-*/
+/cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.log
+*.err
+*.trace
+*.tar
+*.tar.gz
+*.zip
+*~
