@@ -1,52 +1,70 @@
-# Experimental Evaluation: Maximum Weighted Matching Algorithms
+# Maximum-weight matching: Edmonds, Gabow and Scaling
 
-This repository contains the three exact implementations evaluated in the
-paper:
+Three exact research implementations, with one small public API:
 
-- **Edmonds**: unrestricted maximum-weight matching;
-- **Gabow**: unrestricted maximum-weight matching; and
-- **Scaling**: maximum-weight perfect matching using the practical Figure-6
-  configuration used for the paper's headline experiments.
-
-The public API contains only these three entry points. Supporting data
-structures remain private so that users do not have to navigate development
-variants or experiment-campaign scripts.
-
-## Where the algorithms are
-
-| Algorithm | Public entry point | Implementation |
+| Program | Public function | Implementation |
 |---|---|---|
-| Edmonds | `Matchbox::Edmonds` | `src/classic/MatchingEngine.h` (`ComputeMaxEdgWghtMatchingEdmondsFastV2`) |
-| Gabow | `Matchbox::Gabow` | `src/classic/MatchingEngine.h` (`ComputeMaxEdgWghtMatchingGabow`) |
-| Scaling | `Matchbox::Scaling` | `src/scaling/ScalingMatching.h` (`computeHybrid`) |
+| Edmonds | `Matchbox::Edmonds` | [`src/classic/MatchingEngine.h`](src/classic/MatchingEngine.h), `ComputeMaxEdgWghtMatchingEdmondsFastV2` |
+| Gabow | `Matchbox::Gabow` | [`src/classic/MatchingEngine.h`](src/classic/MatchingEngine.h), `ComputeMaxEdgWghtMatchingGabow` |
+| Scaling | `Matchbox::Scaling` | [`src/scaling/ScalingMatching.h`](src/scaling/ScalingMatching.h), `computeHybrid` |
 
-Edmonds and Gabow intentionally share one source file because their optimized
-implementations reuse the same primal-dual blossom machinery. Scaling has its
-own private implementation directory. `src/MatchingAlgorithms.cc` is the thin
-public adapter.
+Edmonds and Gabow solve unrestricted maximum-weight matching (MWM). Scaling
+solves maximum-weight **perfect** matching (MWPM) with practical Hybrid:
+full-key driver disabled, with both dissolution frontiers enabled. No
+alternative Scaling configuration is exposed by the public API.
 
-Scaling is compiled with `SCALING_S5_FULL_KEY_DRIVER_DISABLE=1`. This freezes
-the practical configuration used in the experiments; the slower full-key
-research path is not exposed as a selectable public algorithm.
+The classical programs share blossom/search machinery and a tie-breaking
+rule; their candidate-management backends differ. Supporting headers are
+private dependencies, not additional public algorithms.
+[`src/MatchingAlgorithms.cc`](src/MatchingAlgorithms.cc) is the adapter.
+
+## Validated baseline and results
+
+The kernels are the sources used by the verified November 2026 HPC campaign,
+including the classical membership repairs, not the subsequently evolving
+development workspace. See [PROVENANCE.md](PROVENANCE.md) and the
+[source-identity manifest](tests/kernel_source_manifest.json).
+
+[Results and scope](results/README.md) include all **807 timing runs** on
+**102 instances**, with [readable tables](results/TABLES.md), per-trial data
+and a lightweight Python check. Original and deliberately targeted structural
+panels are kept separate. These are not universal speedup claims or an
+external-solver ranking.
 
 ## Build and test
 
-Requirements: CMake 3.20+, a C++17 compiler, and OpenMP.
+Requirements: CMake 3.20+, a C++17 compiler and OpenMP. GNU/Linux is the CI
+target; Cygwin is also used for local verification. Python 3 runs the
+source-identity/results checks, not the matching algorithms.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
+python3 results/check_results.py
 ```
 
-For the native CPU optimization used by the HPC timing builds:
+Portable compilation is the default. To select the fixed campaign CPU target
+(requires an x86-64-v3-capable CPU):
 
 ```bash
-cmake -S . -B build-paper \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DMWM_NATIVE_OPTIMIZATION=ON
-cmake --build build-paper --parallel
+cmake -S . -B build-paper -DCMAKE_BUILD_TYPE=Release \
+  -DMWM_PAPER_CPU_TARGET=ON
+cmake --build build-paper --parallel 2
+ctest --test-dir build-paper --output-on-failure
 ```
+
+`MWM_NATIVE_OPTIMIZATION=ON` instead uses `-march=native`, which is
+machine-specific and is **not** the campaign's fixed target. Do not combine
+these options. This adapter/CLI is not the exact HPC benchmark executable;
+frontend, compiler and validation differences still matter.
+
+On Cygwin, if another Windows Make is on PATH, configure with
+`-G "Unix Makefiles" -DCMAKE_MAKE_PROGRAM=/usr/bin/make`.
+
+Local verification passes with the portable Cygwin build. The fixed-CPU-target
+Cygwin build currently fails two tiny tests; see PROVENANCE.md. The Linux CI
+fixed-target gate must pass before that distribution build is promoted.
 
 ## Run
 
@@ -56,20 +74,28 @@ build/bin/mwm_run gabow graph.mtx
 build/bin/mwm_run scaling graph.mtx
 ```
 
-Inputs are weighted, square Matrix Market graphs. Scaling returns
-`no-perfect-matching` when its MWPM objective is not defined for the input.
-Edmonds and Gabow do not require a perfect matching.
+The CLI accepts weighted square Matrix Market graphs. Scaling reports
+`no-perfect-matching` when its perfect-matching objective is infeasible;
+Edmonds and Gabow do not require perfection. Exact integer-weight inputs
+within the checked arithmetic range are the scope of the experiments.
 
-The paper therefore uses two experimental suites: Suite A compares Edmonds and
-Gabow on unrestricted MWM instances; Suite B compares all three on identical
-stored-weight graphs independently screened so that the MWM and MWPM optimum
-weights coincide. No algorithm-specific weight shift or graph reduction is
-used in a three-way timing run.
+For a fair three-way comparison, MWM and MWPM optimum weights must coincide.
+Eligible Suite B inputs were screened independently with LEMON. The new
+structural additions compare only Edmonds and Gabow; no MWPM eligibility is
+assumed. No algorithm-specific weight shift, supplied initial matching or
+supplied duals are used.
 
-## Scope
+## Repository scope
 
-This is the algorithm release, not the experiment-data archive. It deliberately
-omits generated graphs, raw HPC results, paper sources, and campaign-specific
-submission scripts. The code derives from the GPL-3.0 Matchbox project and is
-distributed under the same license; see `LICENSE`, `NOTICE.md`, and
-`PROVENANCE.md`.
+This tree contains the three implementations, required data structures, a
+CLI, small tests and compact results. It omits large datasets, raw matching
+exports, development binaries, manuscript drafts and historical campaign
+directories. Exact cluster scripts and generators remain in the separate
+frozen snapshot identified in PROVENANCE.md.
+
+These are engineered research implementations, not claims to realize every
+original data-structure or asymptotic guarantee. See PROVENANCE.md for source
+identity and evidence limits.
+
+Derived from GPL-3.0 Matchbox; see [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+LEMON is an external experimental oracle, not a library dependency.

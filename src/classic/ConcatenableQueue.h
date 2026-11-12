@@ -324,6 +324,118 @@ public:
     while (!mNodes[cur].leaf) cur = mNodes[cur].right;
     return cur;
   }
+/* CQ_BALANCE_DIAGNOSTIC_BEGIN */
+#ifdef MBX_CQ_BALANCE_DIAGNOSTIC
+  // Read-only, iterative diagnostic. No queue fields or operations are changed.
+  struct DiagnosticShape {
+    Size visited, leaves, actualHeight, storedRootHeight, avlBad;
+    Size badHandles, badParents, badUse, badStructure, badSize, badHeight;
+    Size badPrimary, badSecondary, cycles, duplicates;
+    std::vector<Handle> leafHandles;
+    std::vector<Size> payloads;
+    DiagnosticShape() : visited(0), leaves(0), actualHeight(0), storedRootHeight(0),
+      avlBad(0), badHandles(0), badParents(0), badUse(0), badStructure(0),
+      badSize(0), badHeight(0), badPrimary(0), badSecondary(0), cycles(0), duplicates(0) {}
+    Size errorsExceptBalance() const {
+      return badHandles + badParents + badUse + badStructure + badSize + badHeight +
+             badPrimary + badSecondary + cycles + duplicates;
+    }
+  };
+
+  DiagnosticShape diagnosticInspect(Handle root) const {
+    DiagnosticShape out;
+    if (root == cNullItm) return out;
+    if (root >= mNodes.size()) { ++out.badHandles; return out; }
+    out.storedRootHeight = mNodes[root].height;
+    const Size count = mNodes.size();
+    std::vector<unsigned char> color(count, 0);
+    std::vector<Size> sizes(count, 0), heights(count, 0);
+    std::vector<Size> first(count, 0), last(count, 0), position(count, cNullItm);
+    std::vector<Val> minimum(count, 0), minimum2(count, 0);
+    struct Frame {
+      Handle h, parent;
+      bool exit;
+      Frame(Handle a, Handle b, bool c) : h(a), parent(b), exit(c) {}
+    };
+    std::vector<Frame> pending;
+    pending.push_back(Frame(root, cNullItm, false));
+    while (!pending.empty()) {
+      const Frame frame = pending.back();
+      pending.pop_back();
+      const Handle h = frame.h;
+      if (h == cNullItm || h >= count) { ++out.badHandles; continue; }
+      const Node& node = mNodes[h];
+      if (!frame.exit) {
+        if (node.parent != frame.parent) ++out.badParents;
+        if (color[h] == 1) { ++out.cycles; continue; }
+        if (color[h] == 2) { ++out.duplicates; continue; }
+        color[h] = 1;
+        ++out.visited;
+        if (!node.inUse) ++out.badUse;
+        if (node.leaf) {
+          if (node.left != cNullItm || node.right != cNullItm) ++out.badStructure;
+          sizes[h] = heights[h] = 1;
+          minimum[h] = node.minPrio;
+          minimum2[h] = node.secondaryPriority();
+          first[h] = position[h] = out.leafHandles.size();
+          out.leafHandles.push_back(h);
+          out.payloads.push_back(node.payload);
+          last[h] = out.leafHandles.size();
+          ++out.leaves;
+          if (node.subtreeSize != 1) ++out.badSize;
+          if (node.height != 1) ++out.badHeight;
+          if (node.minLeaf != h) ++out.badPrimary;
+          if (Dual && node.secondaryLeaf() != h) ++out.badSecondary;
+          color[h] = 2;
+        } else {
+          if (node.left == node.right) ++out.badStructure;
+          pending.push_back(Frame(h, frame.parent, true));
+          // LIFO right-then-left preserves the complete in-order leaf sequence.
+          pending.push_back(Frame(node.right, h, false));
+          pending.push_back(Frame(node.left, h, false));
+        }
+      } else {
+        const Handle l = node.left, r = node.right;
+        if (l == cNullItm || r == cNullItm || l >= count || r >= count ||
+            color[l] != 2 || color[r] != 2) {
+          ++out.badStructure;
+          color[h] = 2;
+          continue;
+        }
+        sizes[h] = sizes[l] + sizes[r];
+        heights[h] = 1 + (heights[l] > heights[r] ? heights[l] : heights[r]);
+        first[h] = first[l];
+        last[h] = last[r];
+        minimum[h] = minimum[l] <= minimum[r] ? minimum[l] : minimum[r];
+        minimum2[h] = minimum2[l] <= minimum2[r] ? minimum2[l] : minimum2[r];
+        if ((heights[l] > heights[r] && heights[l] - heights[r] > 1) ||
+            (heights[r] > heights[l] && heights[r] - heights[l] > 1)) ++out.avlBad;
+        if (node.subtreeSize != sizes[h]) ++out.badSize;
+        if (node.height != heights[h]) ++out.badHeight;
+        const Handle witness = node.minLeaf;
+        if (node.minPrio != minimum[h] || witness == cNullItm || witness >= count ||
+            !mNodes[witness].leaf || !mNodes[witness].inUse ||
+            position[witness] == cNullItm || position[witness] < first[h] ||
+            position[witness] >= last[h] || mNodes[witness].minPrio != minimum[h])
+          ++out.badPrimary;
+        if (Dual) {
+          const Handle witness2 = node.secondaryLeaf();
+          // resetPriorities2 may retain any valid tied witness, not necessarily
+          // the leftmost one. Validate value and subtree membership instead.
+          if (node.secondaryPriority() != minimum2[h] || witness2 == cNullItm || witness2 >= count ||
+              !mNodes[witness2].leaf || !mNodes[witness2].inUse ||
+              position[witness2] == cNullItm || position[witness2] < first[h] ||
+              position[witness2] >= last[h] || mNodes[witness2].secondaryPriority() != minimum2[h])
+            ++out.badSecondary;
+        }
+        color[h] = 2;
+      }
+    }
+    out.actualHeight = heights[root];
+    return out;
+  }
+#endif
+/* CQ_BALANCE_DIAGNOSTIC_END */
 
 private:
   struct Node : public ConcatenableQueueSecondary<Dual> {
@@ -580,7 +692,7 @@ private:
     if (hA > hB) {
       // A is taller. Walk down A's right spine until height matches hB+1, splice B there.
       Handle cur = A;
-      while (!mNodes[cur].leaf && rHeight(mNodes[cur].right) > hB + 1)
+      while (!mNodes[cur].leaf && rHeight(cur) > hB + 1)
         cur = mNodes[cur].right;
       // cur is internal node whose right child has height ≤ hB+1, OR cur is a leaf (height 1)
       Handle parentOfCur = mNodes[cur].parent;
@@ -598,7 +710,7 @@ private:
     }
     // hB > hA: walk down B's left spine.
     Handle cur = B;
-    while (!mNodes[cur].leaf && rHeight(mNodes[cur].left) > hA + 1)
+    while (!mNodes[cur].leaf && rHeight(cur) > hA + 1)
       cur = mNodes[cur].left;
     Handle parentOfCur = mNodes[cur].parent;
     Handle newInternal = rAllocInternal(A, cur);

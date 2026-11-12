@@ -61,8 +61,11 @@ void CheckRandomSparseGraphs() {
       }
       const Graph graph(n, source.size(), source, target, edgeWeight);
       const Val optimum = BruteForce(weight);
-      assert(std::fabs(Edmonds(graph).weight - optimum) < 0.5);
-      assert(std::fabs(Gabow(graph).weight - optimum) < 0.5);
+      const MatchingResult edmonds = Edmonds(graph);
+      const MatchingResult gabow = Gabow(graph);
+      assert(std::fabs(edmonds.weight - optimum) < 0.5);
+      assert(std::fabs(gabow.weight - optimum) < 0.5);
+      assert(edmonds.mate == gabow.mate);
     }
   }
 }
@@ -86,8 +89,11 @@ void CheckAllThreeOnCompleteGraphs() {
       }
       const Graph graph(n, source.size(), source, target, edgeWeight);
       const Val optimum = BruteForce(weight);
+      const MatchingResult edmonds = Edmonds(graph);
+      const MatchingResult gabow = Gabow(graph);
+      assert(edmonds.mate == gabow.mate);
       for (const MatchingResult& result :
-           {Edmonds(graph), Gabow(graph), Scaling(graph)}) {
+           {edmonds, gabow, Scaling(graph)}) {
         assert(result.status == SolveStatus::kSuccess);
         assert(result.cardinality == n / 2);
         assert(std::fabs(result.weight - optimum) < 0.5);

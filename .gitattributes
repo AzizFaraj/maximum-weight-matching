@@ -1,4 +1,8 @@
 * text=auto
+CMakeLists.txt text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.json text eol=lf
 *.cc text eol=lf
 *.h text eol=lf
 *.md text eol=lf
@@ -11,3 +15,12 @@
 *.png -text
 *.pdf -text
 *.docx -text
+
+# Retain the exact audited kernel bytes, including historical line endings.
+src/classic/** -text
+src/scaling/** -text
+src/Graph.cc -text
+include/Graph.h -text
+include/Types.h -text
+include/Functional.h -text
+include/Utility.h -text

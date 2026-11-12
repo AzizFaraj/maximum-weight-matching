@@ -11,7 +11,13 @@
 *.log
 *.err
 *.trace
+*.mates
+*.jsonl
 *.tar
 *.tar.gz
 *.zip
 *~
+__pycache__/
+/generated/
+/runs/
+/collections/

@@ -19,6 +19,9 @@
 #include <omp.h>
 #include <ctime>
 #include <cstdlib>
+#ifdef MBX_SHARED_D3_TIE_ORDER
+#include <stdexcept>
+#endif
 
 namespace Matchbox {
 inline long double profNow() {
@@ -61,6 +64,19 @@ inline long double profNow() {
 #include "ConcatenableQueue.h"
 #include "DynamicNCA.h"
 #include "BlossomMerging.h"
+#include "QueuedRowPopulation.h"
+#include "FrontierMembership.h"
+#include "LargestReuseAudit.h"
+#include "TwinCleanupAudit.h"
+#include "MonotoneSupportAudit.h"
+#include "dominant_membership_merge.h"
+#include "MembershipReuseAudit.h"
+#if defined(MBX_GABOW_FRONTIER_AUDIT) || defined(MBX_GABOW_FRONTIER_VERIFY)
+#include "GabowFrontierAudit.h"
+#endif
+#ifdef MBX_CLASSIC_EVENT_TRACE
+#include "classic_event_trace.h"
+#endif
 
 namespace Matchbox {
 
@@ -89,6 +105,29 @@ public:
                          Val* minSlack) const;
 
 private:
+#ifdef MBX_GABOW_FRONTIER_TEST_ACCESS
+  friend struct FrontierReuseTest;
+#endif
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  ClassicEventTrace::Sink mEventTrace;
+  std::vector<ClassicEventTrace::Signature> mEventMembers;
+  Val traceEffectiveY(Size v, Size b) const {
+    // The accepted candidate already supplied b. Do not call topLevel here:
+    // even its const overload writes caches and diagnostic counters.
+    if (b==cNullItm || b>=mBlsm.size()) return mVtx[v].pot;
+    if (mBlsm[b].status==BS_EVEN) return mVtx[v].pot-(mDeltaSum-mBlsm[b].offset);
+    if (mBlsm[b].status==BS_ODD) return mVtx[v].pot+(mDeltaSum-mBlsm[b].offset);
+    return mVtx[v].pot;
+  }
+  void traceAction(ClassicEventTrace::Action action, Size u, Size v,
+                   Size blossom=cNullItm, Size aux1=cNullItm, Size aux2=cNullItm,
+                   Size tree1=cNullItm, Size tree2=cNullItm, int variant=0) {
+    if (!mEventTrace.enabled() || mAbortRun) return;
+    const bool have = blossom < mBlsm.size() && blossom < mEventMembers.size();
+    mEventTrace.commit(action,u,v,have?mBlsm[blossom].base:cNullItm,
+      have?mEventMembers[blossom]:ClassicEventTrace::Signature(),aux1,aux2,tree1,tree2,variant);
+  }
+#endif
   /*
    * Pure GMG-style Edmonds engine. Correctness comes from the persistent
    * primal-dual event loop below; the slow Edmonds oracle, output repair,
@@ -101,6 +140,8 @@ private:
     BS_UNMATCHED = 3
   };
 
+  typedef ::FrontierMembership<Size> Membership;
+  typedef ::FrontierMembershipView<Size> MembershipView;
   struct BlossomData {
     BlossomStatus status;
     Size parent;
@@ -113,7 +154,7 @@ private:
     std::vector<Size> children;
     std::vector<Size> childEdges;
     std::vector<ConcatenableQueue::Handle> splitLeaves;
-    std::vector<Size> vertices;
+    Membership vertices;
     // vertex -> sub-blossom index, for blossomContainsVertex / childIndexContaining.
     // Was std::map<Size,Size>, but it is rebuilt from scratch on EVERY shrink and the
     // per-node red-black-tree malloc/free dominated the shrink path (~4.4s of 5.1s,
@@ -193,7 +234,22 @@ private:
     Val key;
     Size u;
     Size edgeIdx;
-    bool operator>(const HeapEntryD3& o) const { return key > o.key; }
+#ifdef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+    unsigned long long publication;
+#endif
+    bool operator>(const HeapEntryD3& o) const {
+#ifdef MBX_SHARED_D3_TIE_ORDER
+      // pushD3Impl publishes canonical u<v in sorted normalized rows. Thus
+      // (u,edgeIdx) has exactly the order of the checked BM original-edge rank.
+      // Costs are finite and compared exactly; EPS remains an acceptance rule.
+      if (key > o.key) return true;
+      if (o.key > key) return false;
+      if (u != o.u) return u > o.u;
+      return edgeIdx > o.edgeIdx;
+#else
+      return key > o.key;
+#endif
+    }
   };
 
   struct HeapEntryD4 {
@@ -339,6 +395,16 @@ private:
   // mRevIdx[u].size() works via FlatJagged::Row.
   FlatJagged<Size> mRevIdx;
   FlatJagged<char> mD3Queued;
+#ifdef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+  // Only the current publication may consume or clear the canonical slot.
+  // Superseded physical records remain lazy, but cannot become owners again.
+  struct GmgD3Publication {
+    Val key;
+    unsigned long long version;
+    GmgD3Publication() : key(0), version(0) {}
+  };
+  FlatJagged<GmgD3Publication> mGmgD3Publication;
+#endif
   // Profiling counters (Gabow path only).
   Size mProfCleanupCount;
   long double mProfCleanupTime;
@@ -605,6 +671,10 @@ private:
   void augmentOnEdge(Size u, Size v, Size edgeIdxInU);
   void shrinkOnEdge(Size u, Size v, Size edgeIdxInU, Size tree);
   void splitBlossom(Size blossom);
+  bool restoreGabowFrontierMembership(Size parent,const std::vector<Size>& children,
+      const std::vector<ConcatenableQueue::Handle>& roots,Membership* savedParent);
+  void verifyLargestBmPartition(const std::vector<Size>& children,Size oldBm,bool after) const;
+  void verifyGabowFrontierStable(bool force=false) const;
 
   void setGabowBlossomActive(Size blossom, bool active);
   void retireGabowForestVertex(Size v);
@@ -623,6 +693,22 @@ private:
   // remaining atoms under its entry atom, and return the LAST chained atom
   // (the base-side attachment point for the mate blossom). Falls back to the
   // flat-under-anchor install when the cycle is malformed.
+  typedef std::vector<std::pair<Size,Size> > GabowDeferredTwins;
+  void stageGabowTwins(Size u,Size i,GabowDeferredTwins& deferred);
+  void removeStagedGabowTwins(const GabowDeferredTwins& deferred);
+  std::vector<Size> mSupportHead,mSupportNext,mSupportTreeOf,mSupportSingleton;
+  std::vector<unsigned int> mSupportOwnerStamp;
+  unsigned int mSupportOwnerEpoch;
+  void supportPath(Size b,Size x,std::vector<Size>& out);
+  void supportAdd(Size v,Size parent,bool singleton,int kind);
+  Size supportInstallPath(Size b,Size entry,Size anchor);
+  void supportInner(Size b);
+  void supportOuter(Size b);
+  Size supportMergePath(Size v,Size ancestor);
+  void supportBlossom(Size b,Size u,Size v);
+  void supportRepublish();
+  void supportRetireTree(Size tree);
+  void supportVerifyStable(const char* where) const;
   Size installBlossomChainInForest(Size blossom, Size entryVtx, Size anchor);
   // Add Bv's atomic vertices to mAuxNCA under u and register Bv as an alive
   // mBM blossom (so back-edges targeting these vertices are valid).
@@ -673,7 +759,7 @@ private:
   void clearBlossomD2(Size blossom);
   void refreshEvenBlossomEdges(Size blossom);
   void refreshEvenBlossomEdgesSubset(Size blossom,
-                                     const std::vector<Size>& vtxs);
+                                     MembershipView vtxs);
   void refreshMatchedBlossomD2(Size blossom);
   void invalidateMaterializedAncestors(Size vtx);
   Val originalEdgeWeight(Size u, Size v) const;
@@ -683,20 +769,60 @@ private:
   { return u * numVtxs + v; }
   static Val infKey()
   { return std::numeric_limits<Val>::max() / 16.0; }
+  // Append storage: preserve offsets of every original engine member.
+  QueuedRowPopulation<Size> mD3QueuedPopulation;
+  void setD3QueuedFlag(Size u, Size i, char value);
 };
+
+inline void FastMatchingEngineV2::setD3QueuedFlag(Size u, Size i, char value)
+{
+  if (mBackend == kGabow2018) mD3QueuedPopulation.set(mD3Queued, u, i, value);
+  else mD3Queued[u][i] = value;
+}
+
+#include "MonotoneSupport.inc"
 
 inline void FastMatchingEngineV2::compute(const Graph& graph,
                                           std::vector<Size>* mateVec,
                                           Size* card,
                                           Val* edgWght)
 {
+#ifdef MBX_GABOW_FRONTIER_AUDIT
+  FrontierReuseAudit::Session frontierSession((int)mBackend);
+#endif
+
+#ifdef MBX_LARGEST_REUSE_AUDIT
+  LargestReuseAudit::Session largestSession((int)mBackend);
+#endif
   if (mateVec == NULL || card == NULL || edgWght == NULL) return;
+#ifdef MBX_MEMBERSHIP_REUSE_AUDIT
+  MembershipReuseAudit::Session membershipReuseSession((int)mBackend);
+#endif
   init(graph);
+#ifdef MBX_TWIN_CLEANUP_AUDIT
+  TwinCleanupAudit::Session twinCleanupSession((int)mBackend);
+#endif
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  mEventTrace.begin(mNumVtxs,mBackend==kGabow2018?"gabow":"edmonds",mAdj,mWgt);
+  mEventMembers.clear();
+  if (mEventTrace.enabled()) {
+    mEventMembers.resize(mBlsm.size());
+    for (Size v=0;v<mNumVtxs;++v) mEventMembers[v]=ClassicEventTrace::Signature::atom(v);
+  }
+#endif
+#ifdef MBX_MONOTONE_SUPPORT_AUDIT
+  MonotoneSupportAudit::Session monotoneSession((int)mBackend);
+#endif
+  if(mBackend==kGabow2018)supportVerifyStable("initial");
   run();
+  if(mBackend==kGabow2018&&!mAbortRun)supportVerifyStable("final");
   if (mAbortRun) {
     mateVec->assign(mNumVtxs, cNullItm);
     *card = 0;
     *edgWght = 0;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+    mEventTrace.finish(true,mUnmatched,mDeltaSum,*card,*edgWght);
+#endif
     return;
   }
   Size directUnmatched = 0;
@@ -705,6 +831,9 @@ inline void FastMatchingEngineV2::compute(const Graph& graph,
   }
   (void)directUnmatched;
   extractMatching(mateVec, card, edgWght);
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  mEventTrace.finish(false,mUnmatched,mDeltaSum,*card,*edgWght);
+#endif
 #ifndef MBX_NO_DIAGNOSTIC_OUTPUT
   // Structural stats (both backends): shrink count, augment count, and the
   // shrink/augment ratio = "blossom-cascade intensity". High ratio predicts
@@ -800,6 +929,9 @@ inline void FastMatchingEngineV2::compute(const Graph& graph,
       mProfForestStaleQueued, mProfForestStaleKept, mProfForestStaleFired,
       mProfForestStaleRebuilt);
   }
+#endif
+#ifdef MBX_GABOW_FRONTIER_VERIFY
+  verifyGabowFrontierStable(true);
 #endif
 #ifdef MBX_GABOW_SEARCH_AUDIT
   if (mBackend == kGabow2018) {
@@ -1084,6 +1216,12 @@ inline void FastMatchingEngineV2::init(const Graph& graph)
   (void)numEdgs;
 #endif
   mD3Queued.assign(rowLens, (char)0);
+  if (mBackend == kGabow2018) mD3QueuedPopulation.resetZeroRows(mNumVtxs);
+#ifdef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+  if (mBackend == kGMG1986)
+    mGmgD3Publication.assign(rowLens, GmgD3Publication());
+  else mGmgD3Publication.clear();
+#endif
   // Re-push multiplicity table (parallel to mD3Queued). This per-edge array
   // costs ~16 B/edge and is pure instrumentation, so it is only allocated when
   // diagnostics are enabled (GABOW_LOOPDIAG=1). When empty, the pushD3
@@ -1248,6 +1386,12 @@ inline void FastMatchingEngineV2::init(const Graph& graph)
     if (mAdj[v].size() > mAdjStride) mAdjStride = mAdj[v].size();
   }
   if (mAdjStride == 0) mAdjStride = 1;
+#ifdef MBX_SHARED_D3_TIE_ORDER
+  // Every packed original-edge ordinal is below cNullItm. Check before any
+  // multiplication, not after an overflow. This metadata is fixed per graph.
+  if (mNumVtxs && mAdjStride > cNullItm / mNumVtxs)
+    throw std::overflow_error("shared D3 original-edge ordinal overflow");
+#endif
   // Per-(u, edgeIdx) handle tracking, sized to match mAdj. CSR-flat (one heap
   // block each, not mNumVtxs tiny vectors). Row lengths come from mAdj.
   {
@@ -1286,9 +1430,26 @@ inline void FastMatchingEngineV2::init(const Graph& graph)
     }
     singleton[0] = mAuxRoot;
     mBM.make_blossom(singleton);
+    mSupportHead.assign(mNumVtxs,cNullItm);
+    mSupportNext.assign(mNumVtxs+1,cNullItm);
+    mSupportTreeOf.assign(mNumVtxs+1,cNullItm);
+    mSupportOwnerStamp.assign(mNumVtxs+1,0);mSupportOwnerEpoch=0;
+    mSupportSingleton.assign(1,0);
+    for(Size v=0;v<mNumVtxs;++v){mSupportHead[v]=v;mSupportTreeOf[v]=v;}
+
   }
 
   mBlossomCap = mNumVtxs + (mNumVtxs / 2) + 1;
+  // A new graph discards every old membership. Free old per-slot buffers
+  // before vector assignment can retain a large prior frontier as a tiny/dead
+  // header in the new graph. Fresh benchmark engines have no old slots here.
+  if(mBackend==kGabow2018) {
+    for(Size b=0;b<mBlsm.size();++b) {
+      mBlsm[b].vertices.release();
+      std::vector<std::pair<Size,Size> >().swap(mBlsm[b].childOfVtx);
+    }
+    std::vector<std::vector<Size> >().swap(mSplitChildVtxsScratch);
+  }
   mBlsm.assign(mBlossomCap, BlossomData());
   // mMatchboxToBm mapping: matchbox blsmId for trivial blsms 0..mNumVtxs-1
   // maps to mBM blossomId of the same index (set at init below); super-blsm
@@ -1778,34 +1939,77 @@ inline void FastMatchingEngineV2::setExtractMate(
 inline void FastMatchingEngineV2::extractBlossomMatching(
   Size blossom, Size base, Size matching, std::vector<Size>* mateVec) const
 {
-  if (mateVec == NULL || blossom == cNullItm || blossom >= mBlsm.size())
-    return;
-
-  if (trivial(blossom)) {
-    if (matching != cNullItm) setExtractMate(base, edgeDst(matching), mateVec);
-    return;
-  }
-
-  const std::vector<Size>& children = mBlsm[blossom].children;
-  const std::vector<Size>& childEdges = mBlsm[blossom].childEdges;
-  Size k = children.size();
-  if (k == 0 || childEdges.size() != k) return;
-
-  Size ib = childIndexContaining(blossom, base);
-  if (ib == cNullItm || ib >= k) ib = 0;
-
-  extractBlossomMatching(children[ib], base, matching, mateVec);
-
-  for (Size step = 1; step < k; step += 2) {
-    Size si = (ib + step) % k;
-    Size ti = (ib + step + 1) % k;
-    Size edge = mBlsm[children[ti]].next;
-    if (edge == cNullItm) edge = childEdges[si];
-    if (edge == cNullItm) continue;
-    Size x = edgeSrc(edge);
-    Size y = edgeDst(edge);
-    extractBlossomMatching(children[si], y, reverseEncodedEdge(edge), mateVec);
-    extractBlossomMatching(children[ti], x, edge, mateVec);
+  if (mateVec == NULL) return;
+  // The nesting depth can approach n on a large final blossom. Preserve the
+  // recursive visit order with explicit frames so extraction uses heap space
+  // proportional to depth rather than exhausting the process stack.
+  struct Frame {
+    Size blossom, base, matching, k, ib, step, phase, edge;
+    Frame(Size b, Size v, Size m)
+      : blossom(b), base(v), matching(m), k(0), ib(0), step(0),
+        phase(0), edge(cNullItm) {}
+  };
+  std::vector<Frame> frames;
+  frames.push_back(Frame(blossom, base, matching));
+  while (!frames.empty()) {
+    Frame& f = frames.back();
+    if (f.phase == 0) {
+      if (f.blossom == cNullItm || f.blossom >= mBlsm.size()) {
+        frames.pop_back();
+        continue;
+      }
+      if (trivial(f.blossom)) {
+        if (f.matching != cNullItm)
+          setExtractMate(f.base, edgeDst(f.matching), mateVec);
+        frames.pop_back();
+        continue;
+      }
+      f.k = mBlsm[f.blossom].children.size();
+      if (f.k == 0 || mBlsm[f.blossom].childEdges.size() != f.k) {
+        frames.pop_back();
+        continue;
+      }
+      f.ib = childIndexContaining(f.blossom, f.base);
+      if (f.ib == cNullItm || f.ib >= f.k) f.ib = 0;
+      f.step = 1;
+      f.phase = 1;
+      const Size child = mBlsm[f.blossom].children[f.ib];
+      frames.push_back(Frame(child, f.base, f.matching));
+      continue;
+    }
+    if (f.phase == 1) {
+      if (f.step >= f.k) {
+        frames.pop_back();
+        continue;
+      }
+      const Size si = (f.ib + f.step) % f.k;
+      const Size ti = (f.ib + f.step + 1) % f.k;
+      const Size child = mBlsm[f.blossom].children[ti];
+      f.edge = mBlsm[child].next;
+      if (f.edge == cNullItm)
+        f.edge = mBlsm[f.blossom].childEdges[si];
+      if (f.edge == cNullItm) {
+        f.step += 2;
+        continue;
+      }
+      const Size first = mBlsm[f.blossom].children[si];
+      const Size y = edgeDst(f.edge);
+      const Size reverse = reverseEncodedEdge(f.edge);
+      f.phase = 2;
+      frames.push_back(Frame(first, y, reverse));
+      continue;
+    }
+    if (f.phase == 2) {
+      const Size ti = (f.ib + f.step + 1) % f.k;
+      const Size second = mBlsm[f.blossom].children[ti];
+      const Size x = edgeSrc(f.edge);
+      const Size edge = f.edge;
+      f.phase = 3;
+      frames.push_back(Frame(second, x, edge));
+      continue;
+    }
+    f.step += 2;
+    f.phase = 1;
   }
 }
 
@@ -1915,6 +2119,13 @@ inline void FastMatchingEngineV2::start()
     }
 
     Val d1 = INF, d2 = INF, d3 = INF, d4 = INF;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+    Val traceValidated[5] = {0,INF,INF,INF,INF};
+    Val traceYu[5]={},traceYv[5]={},traceWeight[5]={};
+    Size traceBlossom[5]={cNullItm,cNullItm,cNullItm,cNullItm,cNullItm};
+    Size traceTree1[5]={cNullItm,cNullItm,cNullItm,cNullItm,cNullItm};
+    Size traceTree2[5]={cNullItm,cNullItm,cNullItm,cNullItm,cNullItm};
+#endif
     Size d1Vtx = cNullItm;
     Size d2Matched = cNullItm, d2EdgeIdx = cNullItm;
     Size d3U = cNullItm, d3EdgeIdx = cNullItm;
@@ -1954,6 +2165,10 @@ inline void FastMatchingEngineV2::start()
         continue;
       }
       d1 = top.key;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+      traceValidated[1] = cur;
+      traceBlossom[1]=B;traceTree1[1]=mBlsm[B].tree;
+#endif
       d1Vtx = v;
       break;
     }
@@ -2026,6 +2241,11 @@ inline void FastMatchingEngineV2::start()
         continue;
       }
       d2 = top.key;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+      traceValidated[2] = cur;
+      traceBlossom[2]=Bv;traceTree1[2]=evenTree;
+      if (mEventTrace.enabled()) { traceYu[2]=traceEffectiveY(u,Bu);traceYv[2]=traceEffectiveY(v,Bv);traceWeight[2]=mWgt[v][i]; }
+#endif
       d2Matched = v;
       d2EdgeIdx = i;
       break;
@@ -2090,7 +2310,7 @@ inline void FastMatchingEngineV2::start()
             mBmHandleU[u][i] = cNullItm;
             mBmHandleV[u][i] = cNullItm;
             if (u < mD3Queued.size() && i < mD3Queued[u].size())
-              mD3Queued[u][i] = 0;
+              mD3QueuedPopulation.set(mD3Queued, u, i, (char)0);
           }
           continue;
         }
@@ -2184,7 +2404,7 @@ inline void FastMatchingEngineV2::start()
             mBmHandleU[u][i] = cNullItm;
             mBmHandleV[u][i] = cNullItm;
             if (u < mD3Queued.size() && i < mD3Queued[u].size())
-              mD3Queued[u][i] = 0;
+              mD3QueuedPopulation.set(mD3Queued, u, i, (char)0);
           }
           mProfStaleCheckTime += MBX_HOTNOW() - profStaleT0;
           continue;
@@ -2203,7 +2423,7 @@ inline void FastMatchingEngineV2::start()
             mBmHandleU[u][i] = cNullItm;
             mBmHandleV[u][i] = cNullItm;
             if (u < mD3Queued.size() && i < mD3Queued[u].size())
-              mD3Queued[u][i] = 0;
+              mD3QueuedPopulation.set(mD3Queued, u, i, (char)0);
           }
           pushD3(u, i);
           continue;
@@ -2228,12 +2448,17 @@ inline void FastMatchingEngineV2::start()
             mBmHandleV[u][i] = cNullItm;
           }
           if (!removedReturned) mBM.remove_edge(bmHandle);
-          mD3Queued[u][i] = 0;
+          mD3QueuedPopulation.set(mD3Queued, u, i, (char)0);
           mProfStaleCheckTime += MBX_HOTNOW() - profStaleT0;
           pushD3(u, i);
           continue;
         }
         d3 = bmCost;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+        traceValidated[3] = cur;
+        traceTree1[3]=treeU;traceTree2[3]=treeV;
+        if (mEventTrace.enabled()) { traceYu[3]=traceEffectiveY(u,Bu);traceYv[3]=traceEffectiveY(v,Bv);traceWeight[3]=mWgt[u][i]; }
+#endif
         d3U = u;
         d3EdgeIdx = i;
         d3BmHandle = bmHandle;
@@ -2255,6 +2480,10 @@ inline void FastMatchingEngineV2::start()
         continue;
       }
       Size v = mAdj[u][i];
+#ifdef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+      const bool ownsD3Slot = mD3Queued[u][i] != 0 &&
+        top.publication == mGmgD3Publication[u][i].version;
+#endif
       Size Bu = topLevel(u);
       Size Bv = topLevel(v);
       Size treeU = (Bu != cNullItm && Bu < mBlsm.size()) ?
@@ -2285,10 +2514,27 @@ inline void FastMatchingEngineV2::start()
 #ifdef MBX_GABOW_SEARCH_AUDIT
         ++mAudGmgD3Stale;
 #endif
+#ifdef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+        if (ownsD3Slot)
+#endif
         if (u < mD3Queued.size() && i < mD3Queued[u].size())
           mD3Queued[u][i] = 0;
         continue;
       }
+#ifdef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+      if (!ownsD3Slot) {
+        // Keep the state-stale cleanup/D2 discovery above. A superseded
+        // price is never allowed to fire or clear a newer publication.
+        mPQD3.pop();
+#ifdef MBX_GABOW_SEARCH_AUDIT
+        ++mAudGmgD3Stale;
+#endif
+        // Refresh if the live edge has repriced again; unchanged current
+        // publications are suppressed by the publisher, including lower keys.
+        pushD3(u, i);
+        continue;
+      }
+#endif
       Val cur = d3Key(u, i);
       if (cur < top.key - EPS || cur > top.key + EPS) {
         mPQD3.pop();
@@ -2301,6 +2547,11 @@ inline void FastMatchingEngineV2::start()
         continue;
       }
       d3 = top.key;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+      traceValidated[3] = cur;
+      traceTree1[3]=treeU;traceTree2[3]=treeV;
+      if (mEventTrace.enabled()) { traceYu[3]=traceEffectiveY(u,Bu);traceYv[3]=traceEffectiveY(v,Bv);traceWeight[3]=mWgt[u][i]; }
+#endif
       d3U = u;
       d3EdgeIdx = i;
       break;
@@ -2327,6 +2578,10 @@ inline void FastMatchingEngineV2::start()
         continue;
       }
       d4 = top.key;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+      traceValidated[4] = cur;
+      traceBlossom[4]=B;traceTree1[4]=mBlsm[B].tree;
+#endif
       d4Blsm = B;
       break;
     }
@@ -2341,8 +2596,24 @@ inline void FastMatchingEngineV2::start()
 
 
     if (mn >= INF - EPS) break;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+    const Val traceQueueKey = mn;
+    const Val traceOldClock = mDeltaSum;
+#endif
     if (mn < mDeltaSum) mn = mDeltaSum;
     mDeltaSum = mn;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+    if (mEventTrace.enabled()) {
+      Size traceU=cNullItm,traceV=cNullItm;
+      if (which==1) traceU=d1Vtx;
+      else if (which==2) { traceU=mAdj[d2Matched][d2EdgeIdx];traceV=d2Matched; }
+      else if (which==3) { traceU=d3U;traceV=mAdj[d3U][d3EdgeIdx]; }
+      else if (which==4) traceU=mBlsm[d4Blsm].base;
+      mEventTrace.selected(which,traceQueueKey,traceValidated[which],traceOldClock,mDeltaSum,traceU,traceV,
+        traceYu[which],traceYv[which],traceWeight[which]);
+      traceAction(ClassicEventTrace::Dispatch,traceU,traceV,traceBlossom[which],cNullItm,cNullItm,traceTree1[which],traceTree2[which]);
+    }
+#endif
 
     if (which == 1) {
       long double t0 = MBX_HOTNOW();
@@ -2407,7 +2678,7 @@ inline void FastMatchingEngineV2::start()
         mPQD3.pop();
       }
       if (u < mD3Queued.size() && edgeIdx < mD3Queued[u].size())
-        mD3Queued[u][edgeIdx] = 0;
+        setD3QueuedFlag(u, edgeIdx, (char)0);
       Size v = mAdj[u][edgeIdx];
       Size Bu = topLevel(u);
       Size Bv = topLevel(v);
@@ -2433,6 +2704,10 @@ inline void FastMatchingEngineV2::start()
       splitBlossom(d4Blsm);
       mProfActShrinkTime += MBX_HOTNOW() - t0;
     }
+#ifdef MBX_MONOTONE_SUPPORT_VERIFY
+    if(mBackend==kGabow2018&&(mNumVtxs<=32||eventCount<=3||eventCount%16384==0))
+      supportVerifyStable("event");
+#endif
 #ifdef MBX_GABOW_EDGE_WATCH
     watchEdgeState("after", eventCount, which);
 #endif
@@ -2480,7 +2755,7 @@ inline void FastMatchingEngineV2::retireGabowD3ForMatchedBlossom(Size blossom)
   ++mProfEvictCalls;
 
   std::vector<Size> collected;
-  const std::vector<Size>* vertices = NULL;
+  MembershipView vertices;
   const bool atomic = trivial(blossom);
   if (!atomic && !mBlsm[blossom].vertices.empty()) {
     vertices = &mBlsm[blossom].vertices;
@@ -2523,7 +2798,7 @@ inline void FastMatchingEngineV2::retireGabowD3ForMatchedBlossom(Size blossom)
         mBmHandleU[u][edgeIdx] = cNullItm;
         mBmHandleV[u][edgeIdx] = cNullItm;
       }
-      mD3Queued[u][edgeIdx] = 0;
+      mD3QueuedPopulation.set(mD3Queued, u, edgeIdx, (char)0);
     }
   }
 }
@@ -2546,6 +2821,7 @@ inline void FastMatchingEngineV2::matchedToEven(Size blossom, Size tree)
     mBlsm[blossom].status = BS_EVEN;
     mBlsm[blossom].tree = tree;
     mBlsm[blossom].offset = mDeltaSum;
+    if(mBackend==kGabow2018)supportOuter(blossom);
     addTreeMember(blossom, tree);
     refreshEvenBlossomEdges(blossom);
     pushD1ForBlossom(blossom);
@@ -2556,6 +2832,7 @@ inline void FastMatchingEngineV2::matchedToEven(Size blossom, Size tree)
   mBlsm[blossom].status = BS_EVEN;
   mBlsm[blossom].tree = tree;
   mBlsm[blossom].offset = mDeltaSum;
+  if(mBackend==kGabow2018)supportOuter(blossom);
   addTreeMember(blossom, tree);
   clearVertexD2(v);
 
@@ -2582,6 +2859,7 @@ inline void FastMatchingEngineV2::matchedToOdd(Size blossom)
   if (!trivial(blossom)) {
     mBlsm[blossom].status = BS_ODD;
     mBlsm[blossom].offset = mDeltaSum;
+    if(mBackend==kGabow2018)supportInner(blossom);
     pushD4(blossom);
     return;
   }
@@ -2590,6 +2868,7 @@ inline void FastMatchingEngineV2::matchedToOdd(Size blossom)
   clearVertexD2(v);
   mBlsm[blossom].status = BS_ODD;
   mBlsm[blossom].offset = mDeltaSum;
+  if(mBackend==kGabow2018)supportInner(blossom);
 }
 
 inline void FastMatchingEngineV2::evenToMatched(Size blossom, Size /*tree*/)
@@ -2598,7 +2877,7 @@ inline void FastMatchingEngineV2::evenToMatched(Size blossom, Size /*tree*/)
   Val deltaSinceEven = mDeltaSum - mBlsm[blossom].offset;
   if (!trivial(blossom)) {
     std::vector<Size> vtxs;
-    const std::vector<Size>* pvtxs = &mBlsm[blossom].vertices;
+    MembershipView pvtxs = &mBlsm[blossom].vertices;
     if (pvtxs->empty()) {
       collectBlossomVertices(blossom, &vtxs);
       pvtxs = &vtxs;
@@ -2639,7 +2918,7 @@ inline void FastMatchingEngineV2::oddToMatched(Size blossom)
   Val deltaSinceOdd = mDeltaSum - mBlsm[blossom].offset;
   if (!trivial(blossom)) {
     std::vector<Size> vtxs;
-    const std::vector<Size>* pvtxs = &mBlsm[blossom].vertices;
+    MembershipView pvtxs = &mBlsm[blossom].vertices;
     if (pvtxs->empty()) {
       collectBlossomVertices(blossom, &vtxs);
       pvtxs = &vtxs;
@@ -2677,7 +2956,7 @@ inline void FastMatchingEngineV2::oddToEven(Size blossom, Size tree)
   Val deltaSinceOdd = mDeltaSum - mBlsm[blossom].offset;
   if (!trivial(blossom)) {
     std::vector<Size> vtxs;
-    const std::vector<Size>* pvtxs = &mBlsm[blossom].vertices;
+    MembershipView pvtxs = &mBlsm[blossom].vertices;
     if (pvtxs->empty()) {
       collectBlossomVertices(blossom, &vtxs);
       pvtxs = &vtxs;
@@ -2696,7 +2975,7 @@ inline void FastMatchingEngineV2::bakeEvenToMatchedForShrink(Size blossom)
   Val deltaSinceEven = mDeltaSum - mBlsm[blossom].offset;
   if (!trivial(blossom)) {
     std::vector<Size> vtxs;
-    const std::vector<Size>* pvtxs = &mBlsm[blossom].vertices;
+    MembershipView pvtxs = &mBlsm[blossom].vertices;
     if (pvtxs->empty()) {
       collectBlossomVertices(blossom, &vtxs);
       pvtxs = &vtxs;
@@ -2725,7 +3004,7 @@ inline void FastMatchingEngineV2::bakeOddToMatchedForShrink(Size blossom)
   Val deltaSinceOdd = mDeltaSum - mBlsm[blossom].offset;
   if (!trivial(blossom)) {
     std::vector<Size> vtxs;
-    const std::vector<Size>* pvtxs = &mBlsm[blossom].vertices;
+    MembershipView pvtxs = &mBlsm[blossom].vertices;
     if (pvtxs->empty()) {
       collectBlossomVertices(blossom, &vtxs);
       pvtxs = &vtxs;
@@ -2791,6 +3070,7 @@ inline void FastMatchingEngineV2::destroyTree(Size tree)
   }
 
   mTreeMembers[tree].clear();
+  if(mBackend==kGabow2018)supportRetireTree(tree);
 }
 
 inline void FastMatchingEngineV2::unmatchNode(Size vtx)
@@ -2803,6 +3083,9 @@ inline void FastMatchingEngineV2::unmatchNode(Size vtx)
   clearMate(vtx);
   mBlsm[B].base = vtx;
   mBlsm[B].next = cNullItm;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  traceAction(ClassicEventTrace::Settle,vtx,cNullItm,B,cNullItm,cNullItm,tree);
+#endif
 }
 
 inline bool FastMatchingEngineV2::collectPathChildren(Size blossom, Size entryVtx,
@@ -2847,85 +3130,9 @@ inline bool FastMatchingEngineV2::collectPathChildren(Size blossom, Size entryVt
 }
 
 inline Size FastMatchingEngineV2::installBlossomChainInForest(Size blossom,
-    Size entryVtx, Size anchor)
+    Size entryVtx,Size anchor)
 {
-  // Install one atom under `par` if absent; returns whether it is now in T.
-  // (Kept as a local pattern, not a helper, to stay pre-C++11.)
-  if (blossom == cNullItm || blossom >= mBlsm.size()) return anchor;
-  if (trivial(blossom)) {
-    if (entryVtx < mInT.size() && !mInT[entryVtx]) {
-      mAuxNCA.addLeaf(entryVtx, anchor);
-#ifdef MBX_GABOW_SEARCH_AUDIT
-      audNoteAddLeaf(entryVtx);
-#endif
-      mInT[entryVtx] = 1;
-      mBM.set_depth(entryVtx, mAuxNCA.depth(anchor) + 1);
-    }
-    return (entryVtx < mInT.size() && mInT[entryVtx]) ? entryVtx : anchor;
-  }
-  std::vector<std::pair<Size,Size> > chain;
-  Size prev = anchor;
-  if (collectPathChildren(blossom, entryVtx, chain)) {
-    // R7 grow geometry: chain the alternating arc's entry atoms so T-depth
-    // increases along the real path (no flattening of the exposed path).
-    for (Size i = 0; i < chain.size(); ++i) {
-      Size child = chain[i].first;
-      Size ea = chain[i].second;
-      if (ea < mInT.size() && !mInT[ea]) {
-        mAuxNCA.addLeaf(ea, prev);
-#ifdef MBX_GABOW_SEARCH_AUDIT
-        audNoteAddLeaf(ea);
-#endif
-        mInT[ea] = 1;
-        mBM.set_depth(ea, mAuxNCA.depth(prev) + 1);
-      }
-      if (ea < mInT.size() && mInT[ea]) {
-        // Remaining atoms of a nontrivial PATH child hang under its entry
-        // atom (intra-child structure is ADAPTED-flat; the child-level path
-        // itself is faithful).
-        if (child < mBlsm.size() && !trivial(child)) {
-          std::vector<Size> cv;
-          const std::vector<Size>* pc = &mBlsm[child].vertices;
-          if (pc->empty()) { collectBlossomVertices(child, &cv); pc = &cv; }
-          for (Size j = 0; j < pc->size(); ++j) {
-            Size w = (*pc)[j];
-            if (w != ea && w < mInT.size() && !mInT[w]) {
-              mAuxNCA.addLeaf(w, ea);
-#ifdef MBX_GABOW_SEARCH_AUDIT
-              audNoteAddLeaf(w);
-#endif
-              mInT[w] = 1;
-              mBM.set_depth(w, mAuxNCA.depth(ea) + 1);
-            }
-          }
-        }
-        prev = ea;
-      }
-    }
-  } else {
-    ++mProfForestFallback;   // malformed cycle: counted, flat fallback below
-  }
-  // Sweep: any remaining atoms (off-arc children, or the whole blossom in the
-  // fallback case) attach under the entry (or the anchor if the entry never
-  // installed). They are not on the exposed alternating path.
-  Size hub = (entryVtx < mInT.size() && mInT[entryVtx]) ? entryVtx : anchor;
-  {
-    std::vector<Size> vv;
-    const std::vector<Size>* pv = &mBlsm[blossom].vertices;
-    if (pv->empty()) { collectBlossomVertices(blossom, &vv); pv = &vv; }
-    for (Size j = 0; j < pv->size(); ++j) {
-      Size w = (*pv)[j];
-      if (w < mInT.size() && !mInT[w]) {
-        mAuxNCA.addLeaf(w, hub);
-#ifdef MBX_GABOW_SEARCH_AUDIT
-        audNoteAddLeaf(w);
-#endif
-        mInT[w] = 1;
-        mBM.set_depth(w, mAuxNCA.depth(hub) + 1);
-      }
-    }
-  }
-  return prev;
+  return supportInstallPath(blossom,entryVtx,anchor);
 }
 
 inline void FastMatchingEngineV2::extendOnArc(Size u, Size v, Size edgeIdxInU)
@@ -2965,35 +3172,41 @@ inline void FastMatchingEngineV2::extendOnArc(Size u, Size v, Size edgeIdxInU)
       mBlsm[Bm].status == BS_EVEN &&
       mBlsm[Bm].tree == mBlsm[Bu].tree) {
     Size tree = mBlsm[Bm].tree;
-    if (mBackend == kGabow2018) addBvAtomicsToGabowForest(Bv, u, v);
     mBlsm[Bv].tree = tree;
     mBlsm[Bv].pred = reverseEncodedEdge(next);
     mBlsm[Bv].next = next;
     addTreeMember(Bv, tree);
     matchedToOdd(Bv);
+#ifdef MBX_CLASSIC_EVENT_TRACE
+    traceAction(ClassicEventTrace::Grow,u,v,Bv,baseV,mv,tree,cNullItm,1);
+#endif
     return;
   }
   if (Bm != cNullItm && Bm != Bv && Bm < mBlsm.size() &&
       mBlsm[Bm].status == BS_EVEN &&
       mBlsm[Bm].tree != mBlsm[Bu].tree) {
     Size treeM = mBlsm[Bm].tree;
-    if (mBackend == kGabow2018) addBvAtomicsToGabowForest(Bv, u, v);
     mBlsm[Bv].tree = treeM;
     mBlsm[Bv].pred = reverseEncodedEdge(next);
     mBlsm[Bv].next = next;
     addTreeMember(Bv, treeM);
     matchedToOdd(Bv);
+#ifdef MBX_CLASSIC_EVENT_TRACE
+    traceAction(ClassicEventTrace::Grow,u,v,Bv,baseV,mv,treeM,cNullItm,2);
+#endif
     return;
   }
   if (Bm != cNullItm && Bm != Bv && Bm < mBlsm.size() &&
       mBlsm[Bm].status == BS_ODD &&
       mBlsm[Bm].tree == mBlsm[Bu].tree) {
     Size tree = mBlsm[Bm].tree;
-    if (mBackend == kGabow2018) addBvAtomicsToGabowForest(Bv, u, v);
     mBlsm[Bv].tree = tree;
     mBlsm[Bv].pred = reverseEncodedEdge(next);
     mBlsm[Bv].next = next;
     matchedToEven(Bv, tree);
+#ifdef MBX_CLASSIC_EVENT_TRACE
+    traceAction(ClassicEventTrace::Grow,u,v,Bv,baseV,mv,tree,cNullItm,3);
+#endif
     Size idx = edgeIdxInU;
     if (idx == cNullItm) idx = findEdgeIdx(u, v);
     if (idx != cNullItm) shrinkOnEdge(u, v, idx, tree);
@@ -3007,41 +3220,7 @@ inline void FastMatchingEngineV2::extendOnArc(Size u, Size v, Size edgeIdxInU)
   Size tree = mBlsm[Bu].tree;
   mTreeParent[v] = u;
 
-  // Gabow Section 3 paragraph 5 (grow rule). Atomic vertices of Bv (becoming
-  // ODD) and Bm (becoming EVEN, the new S̄ entrants) enter T as descendants
-  // of u. For correctness of mAuxNCA queries from subsequent back-edge
-  // reductions in pushD3, this must precede matchedToEven (which fires
-  // refreshEvenBlossomEdges → pushD3).
-  if (mBackend == kGabow2018) {
-    // Defensive: if the EVEN-side endpoint u somehow isn't in T (shouldn't
-    // happen, but defensive against hook-coverage gaps), re-add it under root
-    // so children of this grow have a path to root.
-    if (u < mInT.size() && !mInT[u]) {
-      mAuxNCA.addLeaf(u, mAuxRoot);
-#ifdef MBX_GABOW_SEARCH_AUDIT
-      audNoteAddLeaf(u);
-#endif
-      mInT[u] = 1;
-      mBM.set_depth(u, 1);
-    }
-    // R7 faithful grow geometry: chain Bv's entry->base alternating path under
-    // u (real parent-child sequence, no flattening of the exposed path); the
-    // base vertex is the attachment point, then Bm (its base IS the mate mv)
-    // hangs below it. Off-arc atoms attach under their blossom's entry (they
-    // are not on the exposed path); intra-child structure is ADAPTED-flat.
-    Size baseAttach = installBlossomChainInForest(Bv, v, u);
-    if (baseV < mInT.size() && !mInT[baseV]) {
-      mAuxNCA.addLeaf(baseV, baseAttach);
-#ifdef MBX_GABOW_SEARCH_AUDIT
-      audNoteAddLeaf(baseV);
-#endif
-      mInT[baseV] = 1;
-      mBM.set_depth(baseV, mAuxNCA.depth(baseAttach) + 1);
-    }
-    Size bmAnchor = (baseV < mInT.size() && mInT[baseV]) ? baseV : baseAttach;
-    (void)installBlossomChainInForest(Bm, mv, bmAnchor);
-  }
-
+  // Supporting-forest admission occurs in matchedToOdd/Even below.
   mBlsm[Bv].tree = tree;
   mBlsm[Bv].pred = encodeEdge(u, v, mNumVtxs);
   mBlsm[Bv].next = next;
@@ -3051,6 +3230,9 @@ inline void FastMatchingEngineV2::extendOnArc(Size u, Size v, Size edgeIdxInU)
   mTreeParent[mv] = baseV;
   mBlsm[Bm].pred = next;
   matchedToEven(Bm, tree);
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  traceAction(ClassicEventTrace::Grow,u,v,Bv,baseV,mv,tree,cNullItm,0);
+#endif
 }
 
 inline void FastMatchingEngineV2::augmentOnArc(Size u, Size v, Size /*edgeIdxInU*/)
@@ -3074,6 +3256,9 @@ inline void FastMatchingEngineV2::augmentOnArc(Size u, Size v, Size /*edgeIdxInU
   refreshMatchedVertexD2(v);
   --mUnmatched;
   ++mProfAugments;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  traceAction(ClassicEventTrace::AugmentArc,u,v,cNullItm,cNullItm,cNullItm,tree);
+#endif
 #ifdef MBX_GABOW_SEARCH_AUDIT
   if (mBackend == kGabow2018) audEmitSearch('a');   // arc augment = one tree consumed
 #endif
@@ -3104,6 +3289,9 @@ inline void FastMatchingEngineV2::augmentOnEdge(Size u, Size v, Size /*edgeIdxIn
     destroyTree(treeV);
     mUnmatched -= 2;
     ++mProfAugments;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+    traceAction(ClassicEventTrace::AugmentEdge,u,v,cNullItm,cNullItm,cNullItm,treeU,treeV);
+#endif
 #ifdef MBX_GABOW_SEARCH_AUDIT
     if (mBackend == kGabow2018) audEmitSearch('e');  // edge augment = two trees consumed
 #endif
@@ -3252,7 +3440,7 @@ inline void FastMatchingEngineV2::shrinkOnEdge(Size u, Size v,
     BlossomStatus oldStatus = mBlsm[child].status;
     if (oldStatus != BS_EVEN) {
       std::vector<Size> childVtxs;
-      const std::vector<Size>* pChildVtxs = &mBlsm[child].vertices;
+      MembershipView pChildVtxs = &mBlsm[child].vertices;
       if (pChildVtxs->empty()) {
         collectBlossomVertices(child, &childVtxs);
         pChildVtxs = &childVtxs;
@@ -3296,7 +3484,7 @@ inline void FastMatchingEngineV2::shrinkOnEdge(Size u, Size v,
   long double profVtxBuildT0 = MBX_HOTNOW();
   for (Size i = 0; i < subblossoms.size(); ++i) {
     std::vector<Size> childVtxs;
-    const std::vector<Size>* pChildVtxs = &mBlsm[subblossoms[i]].vertices;
+    MembershipView pChildVtxs = &mBlsm[subblossoms[i]].vertices;
     if (pChildVtxs->empty()) {
       collectBlossomVertices(subblossoms[i], &childVtxs);
       pChildVtxs = &childVtxs;
@@ -3314,7 +3502,44 @@ inline void FastMatchingEngineV2::shrinkOnEdge(Size u, Size v,
   }
   // Sort childOfVtx by vtx key once, so lookups use lower_bound. (Each vtx appears
   // in exactly one sub-blossom, so keys are unique -- no dedup needed.)
-  std::sort(B.childOfVtx.begin(), B.childOfVtx.end());
+#ifdef MBX_MEMBERSHIP_REUSE_VERIFY
+  std::vector<std::pair<Size, Size> > referenceMembership(B.childOfVtx);
+  std::sort(referenceMembership.begin(), referenceMembership.end());
+#endif
+  // Keep B.vertices, pair construction and minimum-potential traversal intact.
+  // Only replace the final full sort with reuse of a complete sorted child map.
+  MR_ADD(contractions,1);MR_ADD(vertices,B.childOfVtx.size());
+  MR_ADD(reusedSurfaces,B.generation>1);
+  Size dominantIndex=cNullItm,dominantStart=0,dominantCount=0;
+  for(Size at=0;at<B.childOfVtx.size();) {
+    const Size index=B.childOfVtx[at].second;
+    Size end=at+1;
+    while(end<B.childOfVtx.size()&&B.childOfVtx[end].second==index)++end;
+    const std::vector<std::pair<Size,Size> >& cached=mBlsm[subblossoms[index]].childOfVtx;
+    if(!trivial(subblossoms[index]))MR_ADD(nestedChildren,1);
+    if(cached.empty())MR_ADD(emptyCaches,1);
+    if(cached.size()==end-at&&end-at>dominantCount) {
+      dominantIndex=index;dominantStart=at;dominantCount=end-at;
+    }
+    at=end;
+  }
+  bool mergedMembership=false;
+  if(dominantIndex!=cNullItm&&dominantCount>=B.childOfVtx.size()-dominantCount) {
+    mergedMembership=mbxDominantMembershipMerge(B.childOfVtx,
+      mBlsm[subblossoms[dominantIndex]].childOfVtx,
+      dominantIndex,dominantStart,dominantCount);
+  }
+  if(mergedMembership) {
+    MR_ADD(shortcuts,1);MR_ADD(donorVertices,dominantCount);
+    MR_ADD(remainderVertices,B.childOfVtx.size()-dominantCount);
+  } else {
+    MR_ADD(fallbacks,1);std::sort(B.childOfVtx.begin(),B.childOfVtx.end());
+  }
+#ifdef MBX_MEMBERSHIP_REUSE_VERIFY
+  if(B.childOfVtx!=referenceMembership)
+    throw std::runtime_error("membership-reuse full-sort differential mismatch");
+  MR_ADD(verified,1);
+#endif
 #ifdef GMG_MAXBLOSSOM_PROBE
   { extern long long gGmgMaxBlossom; if ((long long)B.vertices.size() > gGmgMaxBlossom) gGmgMaxBlossom = (long long)B.vertices.size(); }
 #endif
@@ -3338,160 +3563,311 @@ inline void FastMatchingEngineV2::shrinkOnEdge(Size u, Size v,
     (void)child;
   }
 
-  // F4: mirror matchbox's shrink in mBM. We walk the super-blossom's canonical
-  // atomic vertex list (B.vertices) and merge all distinct mBM blossoms that
-  // currently contain those vertices into one survivor. Discarded-by-dedup
-  // payloads come back via mMergeDiscarded so we can clear mD3Queued for them.
-  long double profShrinkHookT0 = MBX_HOTNOW();
-  if (mBackend == kGabow2018 && !B.vertices.empty()) {
-    BlossomMerging::BlossomId survivorBm = cNullItm;
-    mMergeDiscarded.clear();
-    // R7 BOTTOM-UP MERGE (adopted): the paper's blossom step merges the
-    // current blossoms ALONG THE SUPPORTING-TREE PATH bottom-up. subblossoms[]
-    // holds the cycle as [left arc bottom-up: Bu..], nca (index leftNca),
-    // [right arc TOP-DOWN: ..Bv]. We therefore fold:
-    //   left arc + nca ascending  (deepest -> nca): indices 0..leftNca
-    //   right arc from its DEEP end (Bv) ascending: indices last..leftNca+1
-    // then join the two arc survivors at the nca. One merge per SUB-BLOSSOM
-    // representative (never per atom -- a sub-blossom's atoms already share
-    // one BM blossom), which also removes the old repeated-atom lookups.
-#ifdef MBX_GABOW_SEARCH_AUDIT
-    unsigned long long audChainLen = 0, audChainUp = 0;
-    Size audPrevDepth = cNullItm; Size audFirstUpIdx = cNullItm;
-#endif
-    // helper-free fold (pre-C++11): two passes over index sequences.
-    Size idxNca = leftNca;   // position of the nca sub-blossom in subblossoms[]
-    BlossomMerging::BlossomId arcSurv[2] = { cNullItm, cNullItm };
-    for (int arc = 0; arc < 2; ++arc) {
-#ifdef MBX_GABOW_SEARCH_AUDIT
-      audPrevDepth = cNullItm;   // each arc is its own bottom-up sequence
-#endif
-      Size ii = (arc == 0) ? 0 : (subblossoms.size() - 1);
-      for (;;) {
-        Size child = subblossoms[ii];
-        Size rep = (child < mBlsm.size())
-                     ? (trivial(child) ? child : mBlsm[child].base) : cNullItm;
-        BlossomMerging::BlossomId wBm =
-          (rep != cNullItm && rep < mNumVtxs) ? mBM.blossom_of(rep) : cNullItm;
-        if (wBm != cNullItm && mBM.blossom_alive(wBm)) {
-#ifdef MBX_GABOW_SEARCH_AUDIT
-          { Size dw = (rep < mNumVtxs) ? mAuxNCA.depth(rep) : 0;
-            if (arcSurv[arc] != cNullItm && wBm != arcSurv[arc]) {
-              ++audChainLen;
-              if (audPrevDepth != cNullItm && dw > audPrevDepth) {
-                ++mAudMergeUpSteps; ++audChainUp;
-                if (audFirstUpIdx == cNullItm) audFirstUpIdx = ii;
-              } else ++mAudMergeDownSteps;
-            }
-            audPrevDepth = dw; }
-#endif
-          if (arcSurv[arc] == cNullItm) arcSurv[arc] = wBm;
-          else if (wBm != arcSurv[arc]) {
-            long double t0 = MBX_HOTNOW();
-            arcSurv[arc] = mBM.merge(arcSurv[arc], wBm, &mMergeDiscarded);
-            ++mProfMergeCount;
-            mProfMergeTime += MBX_HOTNOW() - t0;
-          }
-        }
-        if (arc == 0) { if (ii == idxNca) break; ++ii; }
-        else { if (ii == idxNca + 1) break; --ii; }
-      }
-      if (subblossoms.size() == idxNca + 1) break;   // no right arc
-    }
-    survivorBm = arcSurv[0];
-    if (arcSurv[1] != cNullItm && arcSurv[1] != survivorBm) {
-      long double t0 = MBX_HOTNOW();
-      survivorBm = (survivorBm == cNullItm) ? arcSurv[1]
-                   : mBM.merge(survivorBm, arcSurv[1], &mMergeDiscarded);
-      ++mProfMergeCount;
-      mProfMergeTime += MBX_HOTNOW() - t0;
-    }
-#ifdef MBX_GABOW_SEARCH_AUDIT
-    if (audChainLen) {
-      ++mAudMergeChains;
-      if (audChainLen > mAudMergeChainMax) mAudMergeChainMax = audChainLen;
-      if (audChainUp && mAudEmitPerSearch && mAudMergeOrderLogged < 8) {
-        ++mAudMergeOrderLogged;
-        std::fprintf(stderr,
-          "IAUDORDER shrink merge chain len=%llu upSteps=%llu firstDivergenceAtIdx=%lu "
-          "(depth increase within an arc; must be 0 under faithful geometry)\n",
-          audChainLen, audChainUp, (unsigned long)audFirstUpIdx);
-      }
-    }
-#endif
-    if (survivorBm != cNullItm) {
-      if (surface < mMatchboxToBm.size()) mMatchboxToBm[surface] = survivorBm;
-      mBM.set_vertex_blossom_active(B.vertices[0], true);
-      for (Size i = 0; i < subblossoms.size(); ++i) {
-        if (subblossoms[i] < mMatchboxToBm.size())
-          mMatchboxToBm[subblossoms[i]] = survivorBm;
-      }
-      for (Size i = 0; i < B.vertices.size(); ++i) {
-        Size w = B.vertices[i];
-        if (w < mMatchboxToBm.size()) mMatchboxToBm[w] = survivorBm;
-      }
-    }
-    // For each dedup-discarded payload, clear tracking AND directly re-push
-    // via pushD3. We can't rely on matchbox's refresh because shrinkOnEdge's
-    // refreshEvenBlossomEdgesSubset only covers vertices of sub-blossoms
-    // that weren't already EVEN — edges of already-EVEN vertices that get
-    // dedup-discarded would silently disappear without this direct push.
-    // Pass 1: remove the surviving mate of every discarded payload. Do ALL
-    // removals before ANY re-push, so a re-push's make_edge can't realloc a
-    // slot we're about to reference. Uses remove_edge_if with the stored
-    // generation so a handle whose slot was freed/reused is a safe no-op.
-    for (Size i = 0; i < mMergeDiscarded.size(); ++i) {
-      Size pl = mMergeDiscarded[i];
-      Size pu = pl / mAdjStride;
-      Size pi = pl % mAdjStride;
-      if (pu < mBmHandleU.size() && pi < mBmHandleU[pu].size()) {
-        if (mBmHandleU[pu][pi] != cNullItm)
-          mBM.remove_edge_if(mBmHandleU[pu][pi], mBmGenU[pu][pi]);
-        if (mBmHandleV[pu][pi] != cNullItm)
-          mBM.remove_edge_if(mBmHandleV[pu][pi], mBmGenV[pu][pi]);
-        mBmHandleU[pu][pi] = cNullItm;
-        mBmHandleV[pu][pi] = cNullItm;
-      }
-      if (pu < mD3Queued.size() && pi < mD3Queued[pu].size())
-        mD3Queued[pu][pi] = 0;
-    }
-    // Pass 2: re-push all discarded payloads (fresh make_edge pairs).
-    // EXPERIMENT (GABOW_NOREPUSH=1): skip the re-push to measure the upper-bound
-    // time savings. THIS BREAKS CORRECTNESS (valid edges silently dropped) — only
-    // for measuring the ceiling on what fixing the discard-repush churn could save.
-    if (!mGabowNoRepushExpt) {
-      for (Size i = 0; i < mMergeDiscarded.size(); ++i) {
-        Size pl = mMergeDiscarded[i];
-        Size pu = pl / mAdjStride;
-        Size pi = pl % mAdjStride;
-        pushD3(pu, pi);
-      }
-    }
-    mProfShrinkDiscarded += mMergeDiscarded.size();
-  }
-  if (mBackend == kGabow2018) mProfShrinkHookTime += MBX_HOTNOW() - profShrinkHookT0;
+  // Monotone support: add missing inner atoms and merge actual parent paths.
+  // No full-inner BM owner is manufactured or later split during expansion.
+  if(mBackend==kGabow2018)supportBlossom(surface,u,v);
 
   addTreeMember(surface, tree);
   { long double t0 = MBX_HOTNOW();
     refreshEvenBlossomEdgesSubset(surface, shrinkSurfaceScanVtxs);
     mProfShrinkRefreshTime += MBX_HOTNOW() - t0; }
   pushD1ForBlossom(surface);
+
+  // A child is now represented by the parent's flattened membership cache.
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  if (mEventTrace.enabled()) {
+    if (mEventMembers.size()<mBlsm.size())mEventMembers.resize(mBlsm.size());
+    ClassicEventTrace::Signature signature;
+    bool traceNested=false;
+    for (Size i=0;i<subblossoms.size();++i) {
+      signature.add(mEventMembers[subblossoms[i]]);
+      if (mEventMembers[subblossoms[i]].count>1)traceNested=true;
+    }
+    mEventTrace.shrinkLifecycle(mEventMembers[surface].count>0,traceNested,signature.count);
+    mEventMembers[surface]=signature;
+    traceAction(ClassicEventTrace::Shrink,u,v,surface,cNullItm,cNullItm,tree);
+  }
+#endif
+  // Keeping the child's own flattened vertices and vertex-to-child map would
+  // retain one full copy at every level of a nested blossom chain. The
+  // hierarchy (children/parent) remains intact for expansion and for the
+  // uncached membership queries below. Trivial blossoms keep their one vertex.
+  for (Size i = 0; i < subblossoms.size(); ++i) {
+    Size child = subblossoms[i];
+    if (trivial(child)) continue;
+    mBlsm[child].vertices.release();
+    std::vector<std::pair<Size, Size> >().swap(mBlsm[child].childOfVtx);
+  }
+#ifdef MBX_GABOW_FRONTIER_VERIFY
+  verifyGabowFrontierStable();
+#endif
 }
 
 
-inline void FastMatchingEngineV2::addBvAtomicsToGabowForest(Size Bv, Size u, Size v)
+inline void FastMatchingEngineV2::addBvAtomicsToGabowForest(Size Bv,Size u,Size v)
 {
-  if (u < mInT.size() && !mInT[u]) {
-    mAuxNCA.addLeaf(u, mAuxRoot);
-#ifdef MBX_GABOW_SEARCH_AUDIT
-    audNoteAddLeaf(u);
-#endif
-    mInT[u] = 1;
-    mBM.set_depth(u, 1);
+  supportInstallPath(Bv,v,u);
+}
+
+// Gabow-only frontier cache restoration. CQ and membership use the same ordered
+// child concatenation; do not use this to retain flattened nested ancestors.
+inline bool FastMatchingEngineV2::restoreGabowFrontierMembership(
+    Size parent,const std::vector<Size>& children,
+    const std::vector<ConcatenableQueue::Handle>& roots,
+    Membership* savedParent)
+{
+  if(mBackend!=kGabow2018)return true;
+  if(savedParent==NULL || parent>=mBlsm.size() || trivial(parent) || !mBlsm[parent].alive || children.empty() || children.size()!=roots.size()) {
+    abortRun("frontier-invalid-header");return false;
   }
-  // R7: an outer blossom entering T installs its entry->base chain under u
-  // (real path geometry), with off-arc atoms under the entry.
-  (void)installBlossomChainInForest(Bv, v, u);
+  savedParent->clear();
+  Size total=0;
+  for(Size i=0;i<children.size();++i) {
+    if(children[i]>=mBlsm.size() || !mBlsm[children[i]].alive || roots[i]==cNullItm || roots[i]>=mCQ.poolSize()) {
+      abortRun("frontier-invalid-child-root");return false;
+    }
+    Size count=mCQ.size(roots[i]);
+    if(count==0 || total>mNumVtxs || count>mNumVtxs-total) {
+      abortRun("frontier-invalid-range-size");return false;
+    }
+    total+=count;
+  }
+  // Rebuild only if the parent cache is genuinely absent, while its hierarchy
+  // still exists. Normal candidate splits transfer a pre-existing parent list.
+  const bool cached=!mBlsm[parent].vertices.empty();
+  if(!cached){std::vector<Size> fallback;collectBlossomVertices(parent,&fallback);savedParent->assign(fallback.begin(),fallback.end());}
+  const Membership& members=cached?mBlsm[parent].vertices:*savedParent;
+  if(total!=members.size()) {abortRun("frontier-parent-size-mismatch");return false;}
+  Size offset=0;
+  for(Size i=0;i<children.size();++i) {
+    const Size child=children[i],count=mCQ.size(roots[i]);
+    if(count>members.size()-offset) {abortRun("frontier-range-overflow");return false;}
+    if(trivial(child) && (count!=1 || members[offset]!=child || mBlsm[child].vertices.size()!=1 || mBlsm[child].vertices[0]!=child)) {
+      abortRun("frontier-invalid-singleton");return false;
+    }
+#ifdef MBX_GABOW_FRONTIER_VERIFY
+    // Independently traverse hierarchy, explicitly ignoring nontrivial caches.
+    std::vector<Size> expected,pending(1,child);
+    while(!pending.empty()) {
+      Size b=pending.back();pending.pop_back();
+      if(b>=mBlsm.size())throw std::runtime_error("frontier verification: bad hierarchy");
+      if(trivial(b))expected.push_back(b);
+      else for(Size j=mBlsm[b].children.size();j>0;--j)pending.push_back(mBlsm[b].children[j-1]);
+    }
+    if(expected.size()!=count || !std::equal(expected.begin(),expected.end(),members.begin()+offset))
+      throw std::runtime_error("frontier verification: ordered hierarchy mismatch");
+    std::vector<ConcatenableQueue::Handle> leaves;
+    mCQ.collectLeaves(roots[i],leaves);
+    if(leaves.size()!=count)throw std::runtime_error("frontier verification: CQ size mismatch");
+    for(Size j=0;j<count;++j)if(mCQ.payload(leaves[j])!=members[offset+j])
+      throw std::runtime_error("frontier verification: ordered CQ mismatch");
+    ++FrontierReuseAudit::state().orderedChecks;++FrontierReuseAudit::state().cqChecks;
+#endif
+    offset+=count;
+  }
+  if(offset!=members.size()) {abortRun("frontier-unconsumed-parent");return false;}
+  // No mutation of child caches occurs until the complete partition is valid.
+  if(cached)savedParent->swap(mBlsm[parent].vertices);
+#ifdef MBX_GABOW_FRONTIER_AUDIT
+  FrontierReuseAudit::State& observed=FrontierReuseAudit::state();
+  ++observed.calls;if(cached)++observed.parentHits;else ++observed.parentFallbacks;
+  observed.parentLeaves+=savedParent->size();observed.children+=children.size();
+  FrontierReuseAudit::maximum(observed.maxParentSize,savedParent->size());
+  FrontierReuseAudit::maximum(observed.maxParentCapacity,savedParent->capacity());
+#endif
+
+  Size largest=0,largestOffset=0;
+  offset=0;
+  for(Size i=0;i<children.size();++i) {
+    const Size count=mCQ.size(roots[i]);
+    if(count>mCQ.size(roots[largest])) {largest=i;largestOffset=offset;}
+    offset+=count;
+  }
+  LR_ADD(calls,1); LR_ADD(parentLeaves,savedParent->size());
+  LR_ADD(largestLeaves,mCQ.size(roots[largest]));
+  offset=0;
+  for(Size i=0;i<children.size();++i) {
+    const Size child=children[i],count=mCQ.size(roots[i]);
+    if(!trivial(child)) {
+      if(i!=largest) {
+        mBlsm[child].vertices.assign(savedParent->begin()+offset,savedParent->begin()+offset+count);
+        LR_ADD(smallerCopied,count);
+      }
+#ifdef MBX_GABOW_FRONTIER_AUDIT
+      ++observed.restored;observed.restoredLeaves+=count;
+#endif
+    }
+#ifdef MBX_GABOW_FRONTIER_AUDIT
+    else ++observed.singletons;
+#endif
+    offset+=count;
+  }
+  if(!trivial(children[largest])) {
+    std::size_t copied=0;
+    if(!mBlsm[children[largest]].vertices.takeRange(*savedParent,largestOffset,mCQ.size(roots[largest]),&copied))
+      throw std::runtime_error("largest membership range transfer failed");
+    LR_ADD(compactedCopied,copied); LR_ADD(largestMoved,1);
+  } else savedParent->release();
+#ifdef MBX_LARGEST_REUSE_VERIFY
+  for(Size i=0;i<children.size();++i)
+    if(!mBlsm[children[i]].vertices.storageWithinBound())
+      throw std::runtime_error("largest exposed membership exceeds backing bound");
+#endif
+  return true;
+}
+
+
+inline void FastMatchingEngineV2::verifyLargestBmPartition(
+    const std::vector<Size>& children, Size oldBm, bool after) const
+{
+#ifdef MBX_LARGEST_REUSE_VERIFY
+  // This independent checker is intentionally expensive and never timed as
+  // clean solver work. Epoch stamps avoid per-expansion O(n) clearing.
+  static std::vector<unsigned long long> seen;
+  static unsigned long long epoch=0;
+  if(seen.size()!=mNumVtxs) {seen.assign(mNumVtxs,0);epoch=0;}
+  if(++epoch==0) {std::fill(seen.begin(),seen.end(),0);epoch=1;}
+  Size total=0;
+  if(!after) {
+    for(Size i=0;i<children.size();++i)for(Size j=0;j<mBlsm[children[i]].vertices.size();++j) {
+      const Size w=mBlsm[children[i]].vertices[j];
+      if(w>=mNumVtxs || seen[w]==epoch || mBM.mVtxBlossom[w]!=oldBm)
+        throw std::runtime_error("largest pre partition duplicate/foreign atom");
+      seen[w]=epoch;++total;
+    }
+    if(total!=mBM.blossom_size(oldBm))throw std::runtime_error("largest pre missing atoms");
+    const Size head=mBM.mBlossoms[oldBm].vtxListHead;
+    Size cur=head;
+    for(Size j=0;j<total;++j) {
+      if(cur>=mNumVtxs || seen[cur]!=epoch || mBM.mVtxBlossom[cur]!=oldBm)
+        throw std::runtime_error("largest pre ring ownership");
+      // Clear visited stamp: a repeated short cycle cannot pass the size test.
+      seen[cur]=0;
+      const Size next=mBM.mVtxNext[cur],prev=mBM.mVtxPrev[cur];
+      if(next>=mNumVtxs || prev>=mNumVtxs || mBM.mVtxPrev[next]!=cur || mBM.mVtxNext[prev]!=cur)
+        throw std::runtime_error("largest pre broken ring");
+      cur=next;
+    }
+    if(cur!=head)throw std::runtime_error("largest pre ring size");
+    LR_ADD(preChecks,1);
+  } else {
+    for(Size i=0;i<children.size();++i) {
+      const Size child=children[i],id=mMatchboxToBm[child];
+      MembershipView members=mBlsm[child].vertices;
+      if(!mBM.blossom_alive(id) || mBM.blossom_size(id)!=members.size())
+        throw std::runtime_error("largest post child header");
+      Size expectedRoot=members[0];
+      for(Size j=0;j<members.size();++j) {
+        const Size w=members[j];
+        if(w>=mNumVtxs || seen[w]==epoch || mBM.mVtxBlossom[w]!=id || mMatchboxToBm[w]!=id)
+          throw std::runtime_error("largest post child membership/map");
+        seen[w]=epoch;
+        if(mBM.mDepth[w]<mBM.mDepth[expectedRoot])expectedRoot=w;
+      }
+      if(mBM.mBlossoms[id].rootVertex!=expectedRoot || mBM.mBlossoms[id].rank!=mBM.logFloor(members.size()))
+        throw std::runtime_error("largest post child root/rank");
+      Size head=mBM.mBlossoms[id].vtxListHead,cur=head;
+      for(Size j=0;j<members.size();++j) {
+        if(cur>=mNumVtxs || seen[cur]!=epoch || mBM.mVtxBlossom[cur]!=id)
+          throw std::runtime_error("largest post ring membership/size");
+        seen[cur]=0;
+        const Size next=mBM.mVtxNext[cur],prev=mBM.mVtxPrev[cur];
+        if(next>=mNumVtxs || prev>=mNumVtxs || mBM.mVtxPrev[next]!=cur || mBM.mVtxNext[prev]!=cur)
+          throw std::runtime_error("largest post broken ring");
+        cur=next;
+      }
+      if(cur!=head)throw std::runtime_error("largest post ring closure");
+    }
+    LR_ADD(postChecks,1);
+  }
+#else
+  (void)children;(void)oldBm;(void)after;
+#endif
+}
+
+inline void FastMatchingEngineV2::verifyGabowFrontierStable(bool force) const
+{
+#ifdef MBX_GABOW_FRONTIER_VERIFY
+  if(mBackend!=kGabow2018 || mAbortRun || (!force && mNumVtxs>4096))return;
+  unsigned long long liveSize=0,liveCapacity=0,deadCapacity=0,scratchCapacity=0,liveMapCapacity=0,deadMapCapacity=0;
+  std::vector<unsigned char> frontierOwner(mNumVtxs,0);
+  for(Size b=0;b<mBlsm.size();++b) {
+    const BlossomData& B=mBlsm[b];
+    if(B.alive) {
+      if(!B.vertices.storageWithinBound())throw std::runtime_error("largest stable backing bound");
+      liveSize+=B.vertices.size();liveCapacity+=B.vertices.capacity();
+      liveMapCapacity+=B.childOfVtx.capacity();
+      if(!trivial(b) && B.parent!=cNullItm && (!B.vertices.empty() || B.vertices.capacity()!=0 || !B.childOfVtx.empty() || B.childOfVtx.capacity()!=0))
+        throw std::runtime_error("frontier verification: retained nested cache");
+      if(!trivial(b) && B.parent==cNullItm && B.vertices.empty())
+        throw std::runtime_error("frontier verification: missing exposed cache");
+      if(!trivial(b) && B.parent==cNullItm)for(Size j=0;j<B.vertices.size();++j) {
+        Size v=B.vertices[j];
+        if(v>=mNumVtxs || frontierOwner[v])throw std::runtime_error("frontier verification: overlapping exposed membership");
+        frontierOwner[v]=1;
+      }
+    } else {
+      deadCapacity+=B.vertices.capacity();
+      deadMapCapacity+=B.childOfVtx.capacity();
+      if(B.vertices.capacity()>4096)throw std::runtime_error("frontier verification: oversized dead cache");
+      if(B.childOfVtx.capacity()>4096)throw std::runtime_error("frontier verification: oversized dead membership map");
+    }
+  }
+  for(Size i=0;i<mSplitChildVtxsScratch.size();++i)scratchCapacity+=mSplitChildVtxsScratch[i].capacity();
+  if(scratchCapacity!=0)throw std::runtime_error("frontier verification: legacy scratch populated");
+  if(liveSize>2*(unsigned long long)mNumVtxs)throw std::runtime_error("frontier verification: non-disjoint live cache sizes");
+  FrontierReuseAudit::State& s=FrontierReuseAudit::state();++s.stableChecks;
+  FrontierReuseAudit::maximum(s.maxLiveSize,liveSize);FrontierReuseAudit::maximum(s.maxLiveCapacity,liveCapacity);
+  FrontierReuseAudit::maximum(s.maxDeadCapacity,deadCapacity);FrontierReuseAudit::maximum(s.maxScratchCapacity,scratchCapacity);
+  FrontierReuseAudit::maximum(s.maxLiveMapCapacity,liveMapCapacity);FrontierReuseAudit::maximum(s.maxDeadMapCapacity,deadMapCapacity);
+#else
+  (void)force;
+#endif
+}
+
+
+// Records may be owned outside the parent currently being partitioned. Keep
+// their exact generations while handles are cleared, but do not run BM removal
+// until the partition's coverage/ring invariants have been completely restored.
+inline void FastMatchingEngineV2::stageGabowTwins(
+    Size u, Size i, GabowDeferredTwins& deferred)
+{
+  if(mBmHandleU[u][i]!=cNullItm) {
+    deferred.push_back(std::make_pair(mBmHandleU[u][i],mBmGenU[u][i]));
+    TC_ADD(saved,1);
+  }
+  if(mBmHandleV[u][i]!=cNullItm) {
+    deferred.push_back(std::make_pair(mBmHandleV[u][i],mBmGenV[u][i]));
+    TC_ADD(saved,1);
+  }
+  TC_PEAK(deferred.size());
+}
+
+inline void FastMatchingEngineV2::removeStagedGabowTwins(
+    const GabowDeferredTwins& deferred)
+{
+  if(deferred.empty())return;
+  // Only called after finish_largest_child_partition, before any republication.
+  // No broad owner deactivation, no payload-based deletion, no stale raw handle.
+  TC_ADD(batches,1);
+  mBM.begin_edge_removal_batch();
+  for(Size k=0;k<deferred.size();++k) {
+    TC_ADD(attempted,1);
+    if(mBM.remove_edge_if_batched(deferred[k].first,deferred[k].second)) {
+      TC_ADD(removed,1);
+    } else {
+      TC_ADD(stale,1);
+    }
+  }
+  mBM.end_edge_removal_batch();
+#ifdef MBX_TWIN_CLEANUP_VERIFY
+  for(Size k=0;k<deferred.size();++k) {
+    Size tag=0;
+    if(mBM.edge_occurrence_tag_if(deferred[k].first,deferred[k].second,&tag))
+      throw std::runtime_error("staged Gabow twin survived exact cleanup");
+    TC_ADD(verified,1);
+  }
+#endif
 }
 
 inline void FastMatchingEngineV2::splitBlossom(Size blossom)
@@ -3506,6 +3882,10 @@ inline void FastMatchingEngineV2::splitBlossom(Size blossom)
 #endif
 
   std::vector<Size> children = mBlsm[blossom].children;
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  const Size traceBase=mBlsm[blossom].base;
+  const ClassicEventTrace::Signature traceMembers=mEventTrace.enabled()?mEventMembers[blossom]:ClassicEventTrace::Signature();
+#endif
   std::vector<Size> childEdges = mBlsm[blossom].childEdges;
   Size tree = mBlsm[blossom].tree;
   Size pred = mBlsm[blossom].pred;
@@ -3532,7 +3912,7 @@ inline void FastMatchingEngineV2::splitBlossom(Size blossom)
   Val parentOddDelta = mDeltaSum - mBlsm[blossom].offset;
   if (parentOddDelta != 0) {
     std::vector<Size> parentVtxs;
-    const std::vector<Size>* pParentVtxs = &mBlsm[blossom].vertices;
+    MembershipView pParentVtxs = &mBlsm[blossom].vertices;
     if (pParentVtxs->empty()) {
       collectBlossomVertices(blossom, &parentVtxs);
       pParentVtxs = &parentVtxs;
@@ -3562,6 +3942,11 @@ inline void FastMatchingEngineV2::splitBlossom(Size blossom)
     return;
   }
 
+  if(mBackend==kGabow2018) {
+    Membership gabowSavedParentMembership;
+    if(!restoreGabowFrontierMembership(blossom,children,splitRoots,&gabowSavedParentMembership))return;
+  } // Child lists own their data; release the detached parent before BM work.
+
   for (Size i = 0; i < children.size(); ++i) {
     Size child = children[i];
     if (child >= mBlsm.size() || !mBlsm[child].alive) {
@@ -3589,132 +3974,9 @@ inline void FastMatchingEngineV2::splitBlossom(Size blossom)
 
   releaseBlsmId(blossom);
 
-  // F4 companion: mirror matchbox's expand in mBM. The super-blossom's mBM
-  // representative is disposed and each sub-blossom gets a fresh mBM blossom.
-  if (mBackend == kGabow2018) {
-    BlossomMerging::BlossomId oldBm = (blossom < mMatchboxToBm.size())
-                                        ? mMatchboxToBm[blossom] : cNullItm;
-    // Before disposing the super's mBM blossom, remove any back-edges for the
-    // super's atomic vertices — their owner-blossom is about to disappear and
-    // the post-expand topology may leave them as MATCHED rather than EVEN.
-    {
-      std::vector<Size> superVtxs;
-      const std::vector<Size>* pSuperVtxs = &mBlsm[blossom].vertices;
-      if (pSuperVtxs->empty()) {
-        collectBlossomVertices(blossom, &superVtxs);
-        pSuperVtxs = &superVtxs;
-      }
-      // (lazy cleanup: don't preemptively remove. Consumer filters at min_edge.)
-      (void)pSuperVtxs;
-    }
-    // Collect each sub-blossom's atomic vertex set BEFORE dispose (dispose
-    // clears mVtxBlossom but matchbox's children still hold the data).
-    for (Size i = 0; i < children.size(); ++i) {
-      Size child = children[i];
-      if (child >= mBlsm.size()) continue;
-      std::vector<Size> tmp;
-      const std::vector<Size>* pVtxs = &mBlsm[child].vertices;
-      if (pVtxs->empty()) {
-        collectBlossomVertices(child, &tmp);
-        pVtxs = &tmp;
-      }
-      // Clear stale D3-queued bits so refresh can re-push.
-      for (Size j = 0; j < pVtxs->size(); ++j) {
-        Size w = (*pVtxs)[j];
-        if (w < mD3Queued.size()) {
-          for (Size k = 0; k < mD3Queued[w].size(); ++k) mD3Queued[w][k] = 0;
-        }
-      }
-      // Stash atomic vertices for the post-dispose make_blossom call.
-      if (i < mSplitChildVtxsScratch.size()) {
-        mSplitChildVtxsScratch[i] = *pVtxs;
-      } else {
-        mSplitChildVtxsScratch.push_back(*pVtxs);
-      }
-    }
-    bool haveLiveSuper = (oldBm != cNullItm && mBM.blossom_alive(oldBm));
-    if (mGabowD3Log)
-      std::fprintf(stderr, "MIR dissolve mbx=%lu oldBm=%ld live=%d nchild=%lu\n",
-        (unsigned long)blossom, (long)oldBm, (int)haveLiveSuper,
-        (unsigned long)children.size());
-    std::vector<Size> deferredRepush;
-    if (haveLiveSuper) {
-      long double t0 = MBX_HOTNOW();
-      mMergeDiscarded.clear();
-      mBM.dispose_blossom(oldBm, &mMergeDiscarded);
-      ++mProfDisposeCount;
-      mProfDisposeTime += MBX_HOTNOW() - t0;
-      // Clear tracking now, but DEFER the direct re-pushes until AFTER the
-      // sub-blossoms are re-installed in mBM below: a push issued inside the
-      // dispose window can need make_edge on a vertex whose BM coverage is
-      // momentarily gone (under the faithful forest the NCA is a real
-      // ancestor and may lie inside the disposed super -- the star geometry
-      // masked this by always reducing through the root).
-      for (Size k = 0; k < mMergeDiscarded.size(); ++k) {
-        Size pl = mMergeDiscarded[k];
-        Size pu = pl / mAdjStride;
-        Size pi = pl % mAdjStride;
-        if (pu < mD3Queued.size() && pi < mD3Queued[pu].size())
-          mD3Queued[pu][pi] = 0;
-        if (pu < mBmHandleU.size() && pi < mBmHandleU[pu].size()) {
-          mBmHandleU[pu][pi] = cNullItm;
-          mBmHandleV[pu][pi] = cNullItm;
-        }
-        deferredRepush.push_back(pl);
-      }
-    }
-    if (blossom < mMatchboxToBm.size()) mMatchboxToBm[blossom] = cNullItm;
-    // Re-install each sub-blossom as a fresh mBM blossom — but ONLY if we
-    // actually disposed a super-blossom in mBM. If oldBm was cNullItm (the
-    // super-matchbox-id's mMatchboxToBm was cleared by a prior reset), the
-    // sub-blossoms' atomic vertices already live in whatever mBM blossoms
-    // were established after the reset; disturbing them here would dispose
-    // the WRONG (still-live) mBM blossom and corrupt subsequent shrinks.
-    for (Size i = 0; i < children.size(); ++i) {
-      Size child = children[i];
-      if (child >= mMatchboxToBm.size()) continue;
-      const std::vector<Size>& vtxs = mSplitChildVtxsScratch[i];
-      if (!haveLiveSuper) {
-        // Don't touch mBM. mMatchboxToBm[child] is left cNullItm; subsequent
-        // shrinkOnEdge will discover atoms' current mBM blossoms via
-        // mBM.blossom_of(w) and merge them on demand.
-        mMatchboxToBm[child] = cNullItm;
-        continue;
-      }
-      if (vtxs.empty()) {
-        mMatchboxToBm[child] = cNullItm;
-        continue;
-      }
-      // Depths for the child's atomic vertices must be set before make_blossom.
-      // For atomic vertices already in T (mInT[v] == 1), depth is whatever
-      // mAuxNCA recorded. Re-issue set_depth defensively so mBM has fresh
-      // values.
-      for (Size j = 0; j < vtxs.size(); ++j) {
-        Size w = vtxs[j];
-        if (w < mInT.size() && mInT[w]) {
-          mBM.set_depth(w, mAuxNCA.depth(w));
-        } else {
-          // Defensive: vertex not in T; give it depth 0 so make_blossom can
-          // still install it. It won't participate in pushD3 (the mInT guard
-          // there filters it out).
-          mBM.set_depth(w, 0);
-        }
-      }
-      BlossomMerging::BlossomId newBm = mBM.make_blossom(vtxs);
-      mMatchboxToBm[child] = newBm;
-      for (Size j = 0; j < vtxs.size(); ++j) {
-        Size w = vtxs[j];
-        if (w < mMatchboxToBm.size()) mMatchboxToBm[w] = newBm;
-      }
-    }
-    // BM coverage restored: now safe to re-push the payloads whose records
-    // died with the disposed super (deferred from the dispose window above).
-    for (Size k = 0; k < deferredRepush.size(); ++k) {
-      Size pl = deferredRepush[k];
-      pushD3(pl / mAdjStride, pl % mAdjStride);
-    }
-    deferredRepush.clear();
-  }
+  // Expansion preserves the supporting forest and existing singleton path
+  // owners. matchedToEven adds only newly outer atoms before publication.
+  if(mBackend==kGabow2018){mMatchboxToBm[blossom]=cNullItm;MS_ADD(splits,1);}
 
   bool forward = id > ib ? (((id - ib) % 2) == 0) :
                            (((ib - id) % 2) == 1);
@@ -3796,28 +4058,20 @@ inline void FastMatchingEngineV2::splitBlossom(Size blossom)
           mBlsm[child].parent == cNullItm &&
           mBlsm[child].status == BS_MATCHED) {
         refreshMatchedBlossomD2(child);
-        // R_Scope deep forest: a child still MATCHED after the dissolve walk
-        // left the live tree individually. By the leaves-only-exit invariant
-        // (grows install blossom vertices FLAT under u/v, so only the entry
-        // vertex has T-children, and the entry child is always on the kept
-        // path) these vertices are T-leaves: retiring them cannot orphan a
-        // live vertex's ancestor chain.
-        if (mGabowDeepForest && mGabowDeepSplitClear && mBackend == kGabow2018) {
-          if (trivial(child)) {
-            retireGabowForestVertex(child);
-          } else {
-            std::vector<Size> cv;
-            const std::vector<Size>* pcv = &mBlsm[child].vertices;
-            if (pcv->empty()) { collectBlossomVertices(child, &cv); pcv = &cv; }
-            for (Size j = 0; j < pcv->size(); ++j) {
-              Size w = (*pcv)[j];
-              retireGabowForestVertex(w);
-            }
-          }
-        }
+        // Off-path matched atoms were never inserted into this live forest.
+        // Do not retire/reparent any supporting-tree node during expansion.
+
       }
     }
   }
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  if (mEventTrace.enabled() && !mAbortRun)
+    mEventTrace.commit(ClassicEventTrace::Expand,edgeSrc(pred),edgeDst(pred),traceBase,traceMembers,
+      edgeSrc(next),edgeDst(next),tree);
+#endif
+#ifdef MBX_GABOW_FRONTIER_VERIFY
+  verifyGabowFrontierStable();
+#endif
 }
 
 inline Size FastMatchingEngineV2::acquireBlsmId()
@@ -3873,7 +4127,7 @@ inline void FastMatchingEngineV2::releaseBlsmId(Size id)
   if (B.childEdges.capacity() > retainCap) std::vector<Size>().swap(B.childEdges);
   if (B.splitLeaves.capacity() > retainCap)
     std::vector<ConcatenableQueue::Handle>().swap(B.splitLeaves);
-  if (B.vertices.capacity() > retainCap) std::vector<Size>().swap(B.vertices);
+  if (B.vertices.capacity() > retainCap) B.vertices.release();
   if (B.childOfVtx.capacity() > retainCap)
     std::vector<std::pair<Size, Size> >().swap(B.childOfVtx);
   B.cqRoot = cNullItm;
@@ -3895,6 +4149,9 @@ inline void FastMatchingEngineV2::releaseBlsmId(Size id)
 
 inline void FastMatchingEngineV2::abortRun(const char* reason)
 {
+#ifdef MBX_CLASSIC_EVENT_TRACE
+  mEventTrace.aborted(reason);
+#endif
   (void)reason;
   mAbortRun = true;
 }
@@ -4079,7 +4336,7 @@ inline void FastMatchingEngineV2::pushD1ForBlossom(Size blossom)
   }
 
   std::vector<Size> vtxs;
-  const std::vector<Size>* pvtxs = &mBlsm[blossom].vertices;
+  MembershipView pvtxs = &mBlsm[blossom].vertices;
   if (pvtxs->empty()) {
     collectBlossomVertices(blossom, &vtxs);
     pvtxs = &vtxs;
@@ -4226,8 +4483,20 @@ inline void FastMatchingEngineV2::pushD3Impl(Size u, Size edgeIdx)
   }
 
   Val key = d3Key(u, edgeIdx);
+#ifdef MBX_SHARED_D3_TIE_ORDER
+  if (!std::isfinite(key))
+    throw std::invalid_argument("shared D3 candidate cost must be finite");
+#endif
   const Size occurrenceTag = gabowForestOccurrenceTag(u, v);
 
+#ifdef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+  if (mBackend == kGMG1986 && mD3Queued[u][edgeIdx] != 0) {
+    if (mGmgD3Publication[u][edgeIdx].key == key) return;
+    // Changed prices replace logical ownership without consulting Gabow
+    // handles. A previous physical record stays available only for cleanup.
+    mD3Queued[u][edgeIdx] = 0;
+  }
+#endif
   if (u < mD3Queued.size() && edgeIdx < mD3Queued[u].size() &&
       mD3Queued[u][edgeIdx] != 0) {
     bool sameOccurrence = true;
@@ -4280,7 +4549,7 @@ inline void FastMatchingEngineV2::pushD3Impl(Size u, Size edgeIdx)
         mBmHandleU[u][edgeIdx] = cNullItm;
         mBmHandleV[u][edgeIdx] = cNullItm;
       }
-      mD3Queued[u][edgeIdx] = 0;
+      setD3QueuedFlag(u, edgeIdx, (char)0);
     } else {
       if (mBackend == kGabow2018) ++mProfPushD3Early;
       return;
@@ -4288,31 +4557,9 @@ inline void FastMatchingEngineV2::pushD3Impl(Size u, Size edgeIdx)
   }
 
   if (mBackend == kGabow2018) {
-    // F3/R8: paper Section 3, Simplification 2. Reduce every relevant original
-    // edge uv through a = nca(u,v), using rho for endpoints in different
-    // supporting trees, and submit both nondegenerate path-side back-edges.
-    if (u >= mInT.size() || v >= mInT.size() || !mInT[u] || !mInT[v]) {
-      // Either endpoint not in T. The legacy mPQD3 fallback is UNCONSUMED in
-      // Gabow mode (the D3 consumer goto-skips it), so falling through LOSES
-      // the event. Under the deep forest this indicates an install-coverage
-      // gap: repair defensively by installing the missing endpoint(s) under
-      // rho (star semantics for this edge — correct, unfaithful, counted).
-      if (mGabowDeepForest) {
-        if (u < mInT.size() && !mInT[u]) {
-          mAuxNCA.addLeaf(u, mAuxRoot); mInT[u] = 1; mBM.set_depth(u, 1);
-#ifdef MBX_GABOW_SEARCH_AUDIT
-          audNoteAddLeaf(u);
-#endif
-        }
-        if (v < mInT.size() && !mInT[v]) {
-          mAuxNCA.addLeaf(v, mAuxRoot); mInT[v] = 1; mBM.set_depth(v, 1);
-#ifdef MBX_GABOW_SEARCH_AUDIT
-          audNoteAddLeaf(v);
-#endif
-        }
-        ++mProfForestFallback;
-      }
-    }
+    if(u>=mInT.size()||v>=mInT.size()||!mInT[u]||!mInT[v]||
+       mBM.blossom_of(u)==cNullItm||mBM.blossom_of(v)==cNullItm)
+      throw std::runtime_error("outer candidate is absent from monotone support");
     if (u >= mInT.size() || v >= mInT.size() || !mInT[u] || !mInT[v]) {
       // Still not coverable (out-of-range ids) — fall through to legacy push.
     } else {
@@ -4378,13 +4625,21 @@ inline void FastMatchingEngineV2::pushD3Impl(Size u, Size edgeIdx)
       // policy was an optimization, retired per the R8 work order.)
       if (u != a) {
         long double t0 = MBX_HOTNOW();
+#ifdef MBX_SHARED_D3_TIE_ORDER
+        hU = mBM.make_edge(u, a, key, payload, occurrenceTag, payload);
+#else
         hU = mBM.make_edge(u, a, key, payload, occurrenceTag);
+#endif
         ++mProfMakeEdgeCount;
         mProfMakeEdgeTime += MBX_HOTNOW() - t0;
       }
       if (v != a) {
         long double t0 = MBX_HOTNOW();
+#ifdef MBX_SHARED_D3_TIE_ORDER
+        hV = mBM.make_edge(v, a, key, payload, occurrenceTag, payload);
+#else
         hV = mBM.make_edge(v, a, key, payload, occurrenceTag);
+#endif
         ++mProfMakeEdgeCount;
         mProfMakeEdgeTime += MBX_HOTNOW() - t0;
       }
@@ -4409,7 +4664,7 @@ inline void FastMatchingEngineV2::pushD3Impl(Size u, Size edgeIdx)
         mBmGenV[u][edgeIdx] = mBM.edge_generation(hV);
       }
       if (u < mD3Queued.size() && edgeIdx < mD3Queued[u].size())
-        mD3Queued[u][edgeIdx] = 1;
+        mD3QueuedPopulation.set(mD3Queued, u, edgeIdx, (char)1);
       return;
     }
   }
@@ -4419,12 +4674,29 @@ inline void FastMatchingEngineV2::pushD3Impl(Size u, Size edgeIdx)
   e.key = key;
   e.u = u;
   e.edgeIdx = edgeIdx;
+#ifdef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+  e.publication = 0;
+  if (mBackend == kGMG1986) {
+    if (mGmgD3Publication[u][edgeIdx].version ==
+        std::numeric_limits<unsigned long long>::max()) {
+      abortRun("gmg-d3-publication-overflow");
+      return;
+    }
+    e.publication = mGmgD3Publication[u][edgeIdx].version + 1;
+  }
+#endif
   mPQD3.push(e);
+#ifdef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+  if (mBackend == kGMG1986) {
+    mGmgD3Publication[u][edgeIdx].key = key;
+    mGmgD3Publication[u][edgeIdx].version = e.publication;
+  }
+#endif
 #ifdef MBX_GABOW_SEARCH_AUDIT
   ++mAudGmgD3Pushes;
 #endif
   if (u < mD3Queued.size() && edgeIdx < mD3Queued[u].size())
-    mD3Queued[u][edgeIdx] = 1;
+    setD3QueuedFlag(u, edgeIdx, (char)1);
 }
 
 inline void FastMatchingEngineV2::pushD4(Size blossom)
@@ -4533,13 +4805,14 @@ inline bool FastMatchingEngineV2::blossomContainsVertex(Size blossom,
                        std::make_pair(vtx, (Size)0));
     return it != cov.end() && it->first == vtx;
   }
-  if (!mBlsm[blossom].vertices.empty()) {
-    return std::find(mBlsm[blossom].vertices.begin(),
-                     mBlsm[blossom].vertices.end(), vtx) !=
-           mBlsm[blossom].vertices.end();
-  }
-  for (Size i = 0; i < mBlsm[blossom].children.size(); ++i) {
-    if (blossomContainsVertex(mBlsm[blossom].children[i], vtx)) return true;
+  // The leaf-to-root parent chain answers uncached membership without
+  // scanning every vertex or recursively descending a deep blossom tree.
+  Size current = vtx;
+  for (Size steps = 0; steps < mBlsm.size() && current < mBlsm.size();
+       ++steps) {
+    if (current == blossom) return true;
+    current = mBlsm[current].parent;
+    if (current == cNullItm) break;
   }
   return false;
 }
@@ -4557,19 +4830,18 @@ inline Size FastMatchingEngineV2::childIndexContaining(Size blossom,
     if (it != cov.end() && it->first == vtx) return it->second;
     return cNullItm;
   }
-  for (Size i = 0; i < mBlsm[blossom].children.size(); ++i) {
-    Size child = mBlsm[blossom].children[i];
-    if (child >= mBlsm.size()) continue;
-    if (trivial(child)) {
-      if (child == vtx) return i;
-    } else if (!mBlsm[child].vertices.empty()) {
-      if (std::find(mBlsm[child].vertices.begin(),
-                    mBlsm[child].vertices.end(), vtx) !=
-          mBlsm[child].vertices.end())
-        return i;
-    } else if (blossomContainsVertex(child, vtx)) {
-      return i;
+  Size current = vtx;
+  for (Size steps = 0; steps < mBlsm.size() && current < mBlsm.size();
+       ++steps) {
+    Size parent = mBlsm[current].parent;
+    if (parent == blossom) {
+      const std::vector<Size>& children = mBlsm[blossom].children;
+      for (Size i = 0; i < children.size(); ++i)
+        if (children[i] == current) return i;
+      return cNullItm;
     }
+    if (parent == cNullItm) break;
+    current = parent;
   }
   return cNullItm;
 }
@@ -4578,17 +4850,22 @@ inline void FastMatchingEngineV2::collectBlossomVertices(
   Size blossom, std::vector<Size>* vtxs) const
 {
   if (vtxs == NULL || blossom == cNullItm || blossom >= mBlsm.size()) return;
-  if (!mBlsm[blossom].vertices.empty()) {
-    vtxs->insert(vtxs->end(), mBlsm[blossom].vertices.begin(),
-                 mBlsm[blossom].vertices.end());
-    return;
+  std::vector<Size> pending(1, blossom);
+  while (!pending.empty()) {
+    Size current = pending.back();
+    pending.pop_back();
+    if (current >= mBlsm.size()) continue;
+    const BlossomData& B = mBlsm[current];
+    if (!B.vertices.empty()) {
+      vtxs->insert(vtxs->end(), B.vertices.begin(), B.vertices.end());
+    } else if (trivial(current)) {
+      vtxs->push_back(current);
+    } else {
+      // Reverse push order preserves the original recursive child order.
+      for (Size i = B.children.size(); i > 0; --i)
+        pending.push_back(B.children[i - 1]);
+    }
   }
-  if (trivial(blossom)) {
-    vtxs->push_back(blossom);
-    return;
-  }
-  for (Size i = 0; i < mBlsm[blossom].children.size(); ++i)
-    collectBlossomVertices(mBlsm[blossom].children[i], vtxs);
 }
 
 inline void FastMatchingEngineV2::setTopLevelForBlossom(Size blossom, Size top)
@@ -4600,7 +4877,7 @@ inline void FastMatchingEngineV2::setTopLevelForBlossom(Size blossom, Size top)
 inline void FastMatchingEngineV2::clearBlossomD2(Size blossom)
 {
   std::vector<Size> vtxs;
-  const std::vector<Size>* pvtxs = &mBlsm[blossom].vertices;
+  MembershipView pvtxs = &mBlsm[blossom].vertices;
   if (pvtxs->empty()) {
     collectBlossomVertices(blossom, &vtxs);
     pvtxs = &vtxs;
@@ -4614,7 +4891,7 @@ inline void FastMatchingEngineV2::refreshMatchedBlossomD2(Size blossom)
   materializeBlossomForCurrentBoundary(blossom);
   eraseD2BlossomEntry(blossom);
   std::vector<Size> vtxs;
-  const std::vector<Size>* pvtxs = &mBlsm[blossom].vertices;
+  MembershipView pvtxs = &mBlsm[blossom].vertices;
   if (pvtxs->empty()) {
     collectBlossomVertices(blossom, &vtxs);
     pvtxs = &vtxs;
@@ -4649,7 +4926,7 @@ inline Val FastMatchingEngineV2::originalEdgeWeight(Size u, Size v) const
 inline void FastMatchingEngineV2::refreshEvenBlossomEdges(Size blossom)
 {
   std::vector<Size> vtxs;
-  const std::vector<Size>* pvtxs = &mBlsm[blossom].vertices;
+  MembershipView pvtxs = &mBlsm[blossom].vertices;
   if (pvtxs->empty()) {
     collectBlossomVertices(blossom, &vtxs);
     pvtxs = &vtxs;
@@ -4658,7 +4935,7 @@ inline void FastMatchingEngineV2::refreshEvenBlossomEdges(Size blossom)
 }
 
 inline void FastMatchingEngineV2::refreshEvenBlossomEdgesSubset(
-  Size blossom, const std::vector<Size>& vtxs)
+  Size blossom, MembershipView vtxs)
 {
   Size tree = mBlsm[blossom].tree;
   ++mBestD2CurrentStamp;
@@ -4851,45 +5128,83 @@ inline void FastMatchingEngineV2::materializeBlossomForCurrentBoundary(
 inline void FastMatchingEngineV2::materializeBlossomMatching(Size blossom,
                                                              Size baseVtx)
 {
-  if (blossom == cNullItm || blossom >= mBlsm.size() || trivial(blossom))
-    return;
-  if (mBlsm[blossom].materializedBase == baseVtx) {
-    return;
-  }
-  Size k = mBlsm[blossom].children.size();
-  if (k == 0 || mBlsm[blossom].childEdges.size() != k) return;
-
-  // Materialization is memoized by base. Real recursive walks happen only
-  // after a base change or setMatePair() invalidates ancestors touched by an
-  // internal matching update; repeated boundary refreshes return above.
-  ++mMaterializeDepth;
-  Size ib = childIndexContaining(blossom, baseVtx);
-  if (ib == cNullItm || ib >= k) ib = 0;
-
-  materializeBlossomMatching(mBlsm[blossom].children[ib], baseVtx);
-
-  for (Size step = 1; step < k; step += 2) {
-    Size si = (ib + step) % k;
-    Size ti = (ib + step + 1) % k;
-    Size edge = mBlsm[blossom].childEdges[si];
-    if (edge == cNullItm) continue;
-    Size x = edgeSrc(edge);
-    Size y = edgeDst(edge);
-    if (x >= mNumVtxs || y >= mNumVtxs) continue;
-
-    Size bs = mBlsm[blossom].children[si];
-    Size bt = mBlsm[blossom].children[ti];
-    materializeBlossomMatching(bs, x);
-    materializeBlossomMatching(bt, y);
+  // Memoization and child visit order match the recursive version. Explicit
+  // frames are necessary because a deep nested blossom can exceed the native
+  // call stack even when its membership buffers fit comfortably in memory.
+  struct Frame {
+    Size blossom, baseVtx, k, ib, step, phase, edge;
+    Frame(Size b, Size v)
+      : blossom(b), baseVtx(v), k(0), ib(0), step(0), phase(0),
+        edge(cNullItm) {}
+  };
+  std::vector<Frame> frames;
+  frames.push_back(Frame(blossom, baseVtx));
+  while (!frames.empty()) {
+    Frame& f = frames.back();
+    if (f.phase == 0) {
+      if (f.blossom == cNullItm || f.blossom >= mBlsm.size() ||
+          trivial(f.blossom) ||
+          mBlsm[f.blossom].materializedBase == f.baseVtx) {
+        frames.pop_back();
+        continue;
+      }
+      f.k = mBlsm[f.blossom].children.size();
+      if (f.k == 0 || mBlsm[f.blossom].childEdges.size() != f.k) {
+        frames.pop_back();
+        continue;
+      }
+      ++mMaterializeDepth;
+      f.ib = childIndexContaining(f.blossom, f.baseVtx);
+      if (f.ib == cNullItm || f.ib >= f.k) f.ib = 0;
+      f.step = 1;
+      f.phase = 1;
+      const Size child = mBlsm[f.blossom].children[f.ib];
+      frames.push_back(Frame(child, f.baseVtx));
+      continue;
+    }
+    if (f.phase == 1) {
+      if (f.step >= f.k) {
+        const Size baseChild = mBlsm[f.blossom].children[f.ib];
+        if (baseChild < mBlsm.size())
+          mBlsm[f.blossom].base = mBlsm[baseChild].base;
+        mBlsm[f.blossom].materializedBase = f.baseVtx;
+        --mMaterializeDepth;
+        frames.pop_back();
+        continue;
+      }
+      const Size si = (f.ib + f.step) % f.k;
+      f.edge = mBlsm[f.blossom].childEdges[si];
+      if (f.edge == cNullItm || edgeSrc(f.edge) >= mNumVtxs ||
+          edgeDst(f.edge) >= mNumVtxs) {
+        f.step += 2;
+        continue;
+      }
+      const Size first = mBlsm[f.blossom].children[si];
+      const Size x = edgeSrc(f.edge);
+      f.phase = 2;
+      frames.push_back(Frame(first, x));
+      continue;
+    }
+    if (f.phase == 2) {
+      const Size ti = (f.ib + f.step + 1) % f.k;
+      const Size second = mBlsm[f.blossom].children[ti];
+      const Size y = edgeDst(f.edge);
+      f.phase = 3;
+      frames.push_back(Frame(second, y));
+      continue;
+    }
+    const Size si = (f.ib + f.step) % f.k;
+    const Size ti = (f.ib + f.step + 1) % f.k;
+    const Size bs = mBlsm[f.blossom].children[si];
+    const Size bt = mBlsm[f.blossom].children[ti];
+    const Size x = edgeSrc(f.edge);
+    const Size y = edgeDst(f.edge);
     setMatePair(x, y);
-    if (bs < mBlsm.size()) mBlsm[bs].next = edge;
-    if (bt < mBlsm.size()) mBlsm[bt].next = reverseEncodedEdge(edge);
+    if (bs < mBlsm.size()) mBlsm[bs].next = f.edge;
+    if (bt < mBlsm.size()) mBlsm[bt].next = reverseEncodedEdge(f.edge);
+    f.step += 2;
+    f.phase = 1;
   }
-
-  Size baseChild = mBlsm[blossom].children[ib];
-  if (baseChild < mBlsm.size()) mBlsm[blossom].base = mBlsm[baseChild].base;
-  mBlsm[blossom].materializedBase = baseVtx;
-  --mMaterializeDepth;
 }
 
 inline void FastMatchingEngineV2::flipPathFromTopEven(Size evenBlossom,

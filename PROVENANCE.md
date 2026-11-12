@@ -1,20 +1,92 @@
-# Source provenance
+# Source and experiment identity
 
-The exact Edmonds, Gabow, and Scaling implementation sources in this tree were
-copied from the research/HPC source state based on commit:
+## Verified HPC baseline
+
+The implementation kernels come from the submitted package
+`hpc_mwm_full_peredge_20261104_v3.tar.gz`, not the evolving research workspace:
 
 ```text
-e3f3b6710393c25e2512812beec6aa1d024f17e5
+base commit: e3f3b6710393c25e2512812beec6aa1d024f17e5
+classical source state:
+e3f3b6710393c25e2512812beec6aa1d024f17e5+shared-membership-reuse-e33a6f4c4886
+package SHA-256:
+7ccb4a3546b01b54c328875524cae96ff09f7240261b129708311ff1e86d2864
 ```
 
-The Scaling adapter permanently selects the practical paper configuration by
-defining `SCALING_S5_FULL_KEY_DRIVER_DISABLE=1` before including
-`ScalingMatching.h`.
+The exact submission and preservation index are retained separately in the
+local archival branch `codex/hpc-20261104-v3`, commit `2eeb7a4`, unchanged.
+That archival branch is not yet published by this clean-distribution update;
+its package includes original cluster identifiers and needs a separate
+publication review. Its pending/running language describes when it was
+created. Completed results are documented in this branch's
+[results](results/README.md).
 
-This repository is derived from the GPL-3.0 Matchbox codebase at
-<https://github.com/CSCsw/matchbox>. The local upstream source directory was
-named `matchbox-10.12`. The exact upstream commit represented by that local
-archive was not recorded, so this file does not claim one.
+## Source mapping
 
-After this clean tree receives its first verified commit, that commit becomes
-the authoritative identity for public builds.
+`src/classic/MatchingEngine.h`, `ConcatenableQueue.h`, `BlossomMerging.h` and
+required candidate helpers come from the submitted `candidate/` overrides.
+Other private classic/scaling supports come from `frozen/include/`.
+`src/scaling/ScalingMatching.h` is the submitted practical Scaling kernel;
+no new Scaling optimization was made for this distribution.
+
+Public graph/type/utility headers and `src/Graph.cc` retain submitted bytes.
+The [manifest](tests/kernel_source_manifest.json) records exact source paths
+and hashes; `python3 tests/test_source_identity.py` checks them without the
+cluster. Targeted `.gitattributes` rules preserve historical kernel line
+endings. The adapter, CLI and CMake layout are distribution code, not the
+experiment frontend.
+
+## Frozen behavior and build
+
+The public build fixes shared classical D3 tie ordering, Edmonds publication
+ownership, practical Scaling with the full-key driver disabled, and both
+initial-dissolution and zero-root-cleanup frontiers. Hot profiling and
+diagnostic output are disabled. No initial matching, learned duals or
+algorithm-specific weight offset is supplied.
+
+The measured executable used Linux, GCC 11.4.1, C++17/OpenMP,
+`-O3 -DNDEBUG -march=x86-64-v3 -mtune=generic`, one thread and one inherited
+CPU on exclusive EPYC 9334 nodes. Portable compilation is the default here.
+`MWM_PAPER_CPU_TARGET=ON` selects the fixed instruction target;
+`MWM_NATIVE_OPTIMIZATION=ON` is machine-specific and not equivalent.
+
+Identical kernels do not make this library's CLI identical to the HPC
+benchmark: input compatibility readers, validation, timing scopes and output
+exports differ. The archived cluster package is the reproduction authority
+for reported timings.
+
+## Completed evidence
+
+Jobs 2370437-2370441 cover setup, generation, timing, diagnostics and new
+LEMON references. The result archive was received and reviewed on 2026-11-13.
+Gzip integrity, 807 raw clean records, 1,011 matching-export hashes, 204
+diagnostic checkpoint files, source manifests and 24 new oracle outputs
+passed their recorded consistency checks. Raw matching files are not in Git.
+Original large graphs and HPC executable bytes were absent from the archive;
+the local review did not repeat every input-edge weight scan or independently
+hash the actual executable bytes.
+
+Derived results omit absolute workstation/HPC paths, process IDs and raw
+hostnames. Stable node-group pseudonyms retain observed associations. This
+does not imply that all hardware effects are controlled. Checkpoint agreement
+is probabilistic, not a directly compared complete event stream.
+
+## Distribution checks (2026-11-13)
+
+Portable Release with Cygwin GCC 13.4 passes all three C++ tests, including
+randomized brute-force checks and the 676-vertex membership regression.
+Standalone Python verifies all 35 frozen source files and the exported
+807-row dataset. The fixed x86-64-v3 Cygwin build compiles, but its randomized
+and membership tests exit with signal 11. This is an unresolved distribution
+check, not a finding that the separately validated Linux/GCC 11.4.1 HPC runs
+failed. No kernel was changed to suppress it. A dedicated Linux fixed-target
+CI job is a required release gate; the cause of the Cygwin failure is not
+established.
+
+## Attribution
+
+Derived from the GPL-3.0 [CSCsw Matchbox project](https://github.com/CSCsw/matchbox).
+The local upstream directory was named `matchbox-10.12`; its exact upstream
+commit was not recorded and none is invented here. See LICENSE and NOTICE.md.
+LEMON 1.3.1 was an independent oracle, not linked or redistributed by this
+algorithm library.

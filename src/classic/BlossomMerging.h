@@ -42,9 +42,17 @@
 // ============================================================
 
 #include <vector>
+#include <stdexcept>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#ifdef MBX_SHARED_D3_TIE_ORDER
+#include <stdexcept>
+#endif
+#ifdef MBX_BM_REPLACEMENT_VERIFY
+#include <stdexcept>
+#include <unordered_set>
+#endif
 #include "Types.h"
 #include "FibonacciHeap.h"
 
@@ -163,10 +171,16 @@ public:
   // `occurrenceTag` is an opaque caller-side incarnation identifier. It lets
   // an embedding distinguish a still-live record made for an older supporting
   // forest occurrence from a record for the endpoints' current occurrence.
+  // Experimental shared-D3 policy: tieRank is the immutable original-edge
+  // ordinal, NOT payload, a reduced endpoint, or an allocated record ID.
+  // The caller must explicitly supply it when MBX_SHARED_D3_TIE_ORDER is on;
+  // cNullItm is reserved for unavailable ranks and is rejected. Feature-off
+  // builds ignore it and retain the historical cost-only layout and policy.
   // Returns an EdgeHandle that can be passed to remove_edge later, or
   // cNullItm if the edge was discarded.
   EdgeHandle make_edge(VertexId v, VertexId w, Val t,
-                       Size payload = cNullItm, Size occurrenceTag = 0);
+                       Size payload = cNullItm, Size occurrenceTag = 0,
+                       Size tieRank = cNullItm);
 
   // Remove a previously inserted edge by handle. The handle is invalidated.
   // No-op if h == cNullItm or already removed.
@@ -397,6 +411,9 @@ private:
     VertexId w;          // shallower endpoint
     Val cost;            // the cost t passed to make_edge
     Size payload;        // opaque caller-supplied identifier
+#ifdef MBX_SHARED_D3_TIE_ORDER
+    Size tieRank;        // immutable original-edge ordinal, never slot/endpoint ID
+#endif
     Size rEdge;          // floor(log(depth(v) - depth(w))), fixed at make_edge
     EdgeType type;       // current classification
     VertexId chargedEnd; // v or w per Table 1
@@ -450,6 +467,51 @@ private:
     bool inUse;
   };
 
+  // Internal Design-B contract, used only by the Gabow split mirror below.
+  // Caller guarantees that subsequent child lists are an exact disjoint
+  // partition of Z's current atoms. No BM ownership/ring consumer, callback,
+  // validation, reset, merge or edge removal is allowed until all child makes
+  // finish. There is no rollback; a diagnostic failure aborts the computation.
+  // Numeric old-owner equality alone is NOT a duplicate check: the first
+  // child deliberately reuses Z's slot under the original LIFO allocation.
+  friend class FastMatchingEngineV2;
+
+  // Experimental largest-child lifecycle. No BM consumer may run between
+  // drain and finish. Parent remains allocated; only smaller atoms change owner.
+  void begin_largest_child_partition(BlossomId Z, std::vector<Size>* discarded);
+  template<class Members> BlossomId make_smaller_for_largest_partition(
+      BlossomId Z, const Members& members);
+  void finish_largest_child_partition(BlossomId Z, VertexId canonicalHead,
+      Size remaining, VertexId minimumRoot);
+#ifdef MBX_BM_REPLACEMENT_TEST_ACCESS
+  friend struct BmReplacementTest;
+#endif
+  BlossomId make_blossom_impl(const std::vector<VertexId>& vertices,
+                              BlossomId supersededOwner);
+  void dispose_blossom_impl(BlossomId Z,
+                            std::vector<Size>* outDiscardedPayloads,
+                            bool clearVertexRing);
+  BlossomId make_for_frontier_partition(const std::vector<VertexId>& vertices,
+                                        BlossomId supersededOwner)
+  {
+    assert(supersededOwner != cNullItm);
+    return make_blossom_impl(vertices, supersededOwner);
+  }
+  void dispose_for_frontier_partition(BlossomId Z,
+                                      std::vector<Size>* outDiscardedPayloads)
+  {
+    assert(blossom_alive(Z) && !mEdgeRemovalBatchActive);
+    dispose_blossom_impl(Z, outDiscardedPayloads, false);
+  }
+#ifdef MBX_BM_REPLACEMENT_VERIFY
+  void verify_frontier_partition(BlossomId Z,
+      const std::vector<const std::vector<VertexId>*>& children) const;
+  void verify_frontier_result(
+      const std::vector<const std::vector<VertexId>*>& children,
+      const std::vector<BlossomId>& ids) const;
+#endif
+
+
   Size mN;          // total vertex count (capacity)
   Size mLogN;       // floor(log mN) + 1, max rank value
 
@@ -475,7 +537,39 @@ private:
   // Key = blossom's smallestCost; Payload = BlossomId.
   // Lazy deletion: when a blossom is merged, its H-handle is removed
   // and the new blossom's H-handle is inserted.
-  FibonacciHeap<Val, BlossomId> mH;
+#ifdef MBX_SHARED_D3_TIE_ORDER
+  // Finite exact lexicographic order. No EPS equivalence appears in a heap
+  // comparator. Physical twins may be equivalent if cost and rank coincide.
+  struct MinKey {
+    Val cost;
+    Size tieRank;
+    MinKey(Val c = 0, Size r = cNullItm) : cost(c), tieRank(r) {}
+    bool operator<(const MinKey& rhs) const {
+      if (cost < rhs.cost) return true;
+      if (rhs.cost < cost) return false;
+      return tieRank < rhs.tieRank;
+    }
+    bool operator!=(const MinKey& rhs) const {
+      return *this < rhs || rhs < *this;
+    }
+  };
+  MinKey edgeKey(EdgeHandle e) const {
+    return MinKey(mEdges[e].cost, mEdges[e].tieRank);
+  }
+  MinKey blossomKey(const Blossom& b) const {
+    return MinKey(b.smallestCost, mEdges[b.smallestOverall].tieRank);
+  }
+  static Val keyCost(const MinKey& k) { return k.cost; }
+#else
+  typedef Val MinKey;
+  MinKey edgeKey(EdgeHandle e) const { return mEdges[e].cost; }
+  MinKey blossomKey(const Blossom& b) const { return b.smallestCost; }
+  static Val keyCost(MinKey k) { return k; }
+#endif
+  bool edgeLess(EdgeHandle a, EdgeHandle b) const {
+    return edgeKey(a) < edgeKey(b);
+  }
+  FibonacciHeap<MinKey, BlossomId> mH;
 
   // Auxiliary I[1..log n] array for gather operations during merge.
   // mGatherHead[r] is the head of a singly-linked list of edges with
@@ -631,6 +725,10 @@ inline BlossomMerging::EdgeHandle BlossomMerging::allocEdge()
     e = mEdges.size() - 1;
   }
   mEdges[e].inUse = true;
+#ifdef MBX_SHARED_D3_TIE_ORDER
+  // A reused slot must never retain the previous original edge's witness.
+  mEdges[e].tieRank = cNullItm;
+#endif
   mEdges[e].phChild = cNullItm; mEdges[e].phNext = cNullItm; mEdges[e].phPrev = cNullItm;
   ++mAliveEdges;
   if (mAliveEdges > bmPeakAliveEdges()) bmPeakAliveEdges() = mAliveEdges;
@@ -689,6 +787,13 @@ inline void BlossomMerging::freePacket(Size p)
 inline BlossomMerging::BlossomId
 BlossomMerging::make_blossom(const std::vector<VertexId>& vertices)
 {
+  return make_blossom_impl(vertices, cNullItm);
+}
+
+inline BlossomMerging::BlossomId
+BlossomMerging::make_blossom_impl(const std::vector<VertexId>& vertices,
+                                   BlossomId supersededOwner)
+{
   assert(!vertices.empty());
   BlossomId id = allocBlossom();
   Blossom& B = mBlossoms[id];
@@ -701,7 +806,7 @@ BlossomMerging::make_blossom(const std::vector<VertexId>& vertices)
   for (Size i = 0; i < vertices.size(); ++i) {
     VertexId v = vertices[i];
     assert(v < mN);
-    assert(mVtxBlossom[v] == cNullItm); // paper precondition A ∩ O = ∅
+    assert(mVtxBlossom[v] == supersededOwner); // null for ordinary make; old owner for trusted replacement
     mVtxBlossom[v] = id;
     mVtxPrev[v] = prev;
     mVtxNext[prev] = v;
@@ -770,11 +875,11 @@ inline void BlossomMerging::refreshHEntry(BlossomId b)
     }
     return;
   }
-  Val newCost = B.smallestCost;
+  MinKey newCost = blossomKey(B);
   if (B.hHandle == cNullItm) {
     B.hHandle = mH.insert(newCost, b);
   } else {
-    Val curKey = mH.key(B.hHandle);
+    MinKey curKey = mH.key(B.hHandle);
     if (newCost < curKey) {
       mH.decreaseKey(B.hHandle, newCost);
     } else if (curKey < newCost) {
@@ -813,7 +918,7 @@ inline void BlossomMerging::addToLoose(BlossomId b, EdgeHandle e)
   if (B.looseCount > bmMaxLooseLen()) bmMaxLooseLen() = B.looseCount;
   ++bmLooseLive();
   if (bmLooseLive() > bmLooseLivePeak()) bmLooseLivePeak() = bmLooseLive();
-  if (B.smallestOverall == cNullItm || E.cost < B.smallestCost) {
+  if (B.smallestOverall == cNullItm || edgeLess(e, B.smallestOverall)) {
     B.smallestOverall = e;
     B.smallestCost = E.cost;
     refreshHEntry(b);
@@ -843,7 +948,7 @@ inline void BlossomMerging::addToPacket(BlossomId b, Size rank, EdgeHandle e)
   Edge& E = mEdges[e];
   E.inPacket = true;
   packetInsert(P, e);                     // pairing meld: O(1)
-  if (B.smallestOverall == cNullItm || E.cost < B.smallestCost) {
+  if (B.smallestOverall == cNullItm || edgeLess(e, B.smallestOverall)) {
     B.smallestOverall = e;
     B.smallestCost = E.cost;
     refreshHEntry(b);
@@ -860,7 +965,7 @@ inline BlossomMerging::EdgeHandle BlossomMerging::phMeld(EdgeHandle a, EdgeHandl
 {
   if (a == cNullItm) return b;
   if (b == cNullItm) return a;
-  if (mEdges[b].cost < mEdges[a].cost) { EdgeHandle t = a; a = b; b = t; }
+  if (edgeLess(b, a)) { EdgeHandle t = a; a = b; b = t; }
   // attach b as a's first child
   Edge& A = mEdges[a]; Edge& B = mEdges[b];
   B.phPrev = a;                       // leftmost child: phPrev = parent
@@ -980,7 +1085,7 @@ inline void BlossomMerging::refreshBlossomSmallest(BlossomId b)
     const Packet& P = mPackets[pkIdx];
     if (P.smallestEdge != cNullItm) {
       Val c = mEdges[P.smallestEdge].cost;
-      if (bestE == cNullItm || c < bestC) {
+      if (bestE == cNullItm || edgeLess(P.smallestEdge, bestE)) {
         bestE = P.smallestEdge;
         bestC = c;
       }
@@ -996,8 +1101,18 @@ inline void BlossomMerging::refreshBlossomSmallest(BlossomId b)
 
 inline BlossomMerging::EdgeHandle
 BlossomMerging::make_edge(VertexId v, VertexId w, Val t, Size payload,
-                          Size occurrenceTag)
+                          Size occurrenceTag, Size tieRank)
 {
+#ifdef MBX_SHARED_D3_TIE_ORDER
+  // Validate before any edge allocation or container mutation; finite costs
+  // are necessary for the strict weak order (in particular reject NaN).
+  if (!std::isfinite(t))
+    throw std::invalid_argument("shared D3 BM requires a finite stored cost");
+  if (tieRank == cNullItm)
+    throw std::invalid_argument("shared D3 BM requires an explicit original-edge rank");
+#else
+  (void)tieRank;
+#endif
   assert(v < mN && w < mN);
   // Normalize so v is deeper than w (back-edge orientation).
   if (mDepth[v] < mDepth[w]) {
@@ -1014,6 +1129,9 @@ BlossomMerging::make_edge(VertexId v, VertexId w, Val t, Size payload,
   E.w = w;
   E.cost = t;
   E.payload = payload;
+#ifdef MBX_SHARED_D3_TIE_ORDER
+  E.tieRank = tieRank;
+#endif
   E.occurrenceTag = occurrenceTag;
   E.rEdge = logFloor(mDepth[v] - mDepth[w]);
   EdgeType ty; VertexId u; Size r;
@@ -1121,6 +1239,12 @@ inline void BlossomMerging::end_edge_removal_batch()
 inline void BlossomMerging::dispose_blossom(BlossomId Z,
                                             std::vector<Size>* outDiscardedPayloads)
 {
+  dispose_blossom_impl(Z, outDiscardedPayloads, true);
+}
+
+inline void BlossomMerging::dispose_blossom_impl(BlossomId Z,
+    std::vector<Size>* outDiscardedPayloads, bool clearVertexRing)
+{
   if (Z == cNullItm) return;
   if (Z >= mBlossoms.size() || !mBlossoms[Z].inUse) return;
   Blossom& B = mBlossoms[Z];
@@ -1168,17 +1292,20 @@ inline void BlossomMerging::dispose_blossom(BlossomId Z,
     B.firstPacket = cNullItm;
   }
 
-  // Clear mVtxBlossom for every vertex in Z's ring (and break the ring).
+  // Only the private complete-frontier replacement may skip these dead
+  // stores. Ordinary disposal still clears every vertex/link exactly as before.
   if (B.vtxListHead != cNullItm) {
-    VertexId head = B.vtxListHead;
-    VertexId cur = head;
-    do {
-      VertexId nxt = mVtxNext[cur];
-      mVtxBlossom[cur] = cNullItm;
-      mVtxNext[cur] = cNullItm;
-      mVtxPrev[cur] = cNullItm;
-      cur = nxt;
-    } while (cur != head);
+    if (clearVertexRing) {
+      VertexId head = B.vtxListHead;
+      VertexId cur = head;
+      do {
+        VertexId nxt = mVtxNext[cur];
+        mVtxBlossom[cur] = cNullItm;
+        mVtxNext[cur] = cNullItm;
+        mVtxPrev[cur] = cNullItm;
+        cur = nxt;
+      } while (cur != head);
+    }
     B.vtxListHead = cNullItm;
   }
 
@@ -1186,6 +1313,114 @@ inline void BlossomMerging::dispose_blossom(BlossomId Z,
   B.size = 0;
   B.rank = 0;
   freeBlossom(Z);
+}
+
+
+inline void BlossomMerging::begin_largest_child_partition(
+    BlossomId Z, std::vector<Size>* outDiscardedPayloads)
+{
+  if (!blossom_alive(Z) || mEdgeRemovalBatchActive)
+    throw std::runtime_error("largest partition invalid parent/batch");
+  Blossom& B = mBlossoms[Z];
+  // Remove Z from H.
+  if (B.hHandle != cNullItm) {
+    mH.remove(B.hHandle);
+    B.hHandle = cNullItm;
+  }
+
+  // Free all edges in Z's loose pairing heap (recording payloads for refresh).
+  {
+    if (B.looseHead != cNullItm) {
+      std::vector<EdgeHandle> looseEdges;
+      packetCollect(B.looseHead, looseEdges);
+      for (Size i = 0; i < looseEdges.size(); ++i) {
+        EdgeHandle e = looseEdges[i];
+        if (outDiscardedPayloads != NULL)
+          outDiscardedPayloads->push_back(mEdges[e].payload);
+        freeEdge(e);
+      }
+    }
+    B.looseHead = cNullItm;
+    B.looseSmallest = cNullItm;
+    bmLooseLive() -= B.looseCount;
+    B.looseCount = 0;
+  }
+
+  // Free all edges in each packet (collected from its pairing heap), then free each packet.
+  {
+    std::vector<EdgeHandle> hp;
+    Size pk = B.firstPacket;
+    while (pk != cNullItm) {
+      Size nxt = mPackets[pk].nextInBlossom;
+      hp.clear();
+      packetCollect(mPackets[pk].smallestEdge, hp);
+      for (Size hi = 0; hi < hp.size(); ++hi) {
+        if (outDiscardedPayloads != NULL)
+          outDiscardedPayloads->push_back(mEdges[hp[hi]].payload);
+        freeEdge(hp[hi]);
+      }
+      freePacket(pk);
+      pk = nxt;
+    }
+    B.firstPacket = cNullItm;
+  }
+
+
+  // Existing edge destruction order/generations are preserved above. Keep
+  // owner/ring/header alive, but expose no stale edge/H/minimum state.
+  B.looseSmallestCost = 0;
+  B.smallestOverall = cNullItm;
+  B.smallestCost = 0;
+}
+
+template<class Members>
+inline BlossomMerging::BlossomId BlossomMerging::make_smaller_for_largest_partition(
+    BlossomId Z, const Members& vertices)
+{
+  if (!blossom_alive(Z) || vertices.empty() || vertices.size() >= mBlossoms[Z].size)
+    throw std::runtime_error("largest partition invalid smaller child");
+  // Allocate before modifying vertices. Do not retain Blossom& across this:
+  // vector growth may move every header, including the parent.
+  const BlossomId id = allocBlossom();
+  for (Size i=0; i<vertices.size(); ++i) {
+    const VertexId v=vertices[i];
+    if (v>=mN || mVtxBlossom[v]!=Z)
+      throw std::runtime_error("largest partition foreign/repeated atom");
+    const VertexId prev=mVtxPrev[v], next=mVtxNext[v];
+    if (prev>=mN || next>=mN || mVtxNext[prev]!=v || mVtxPrev[next]!=v)
+      throw std::runtime_error("largest partition old ring links");
+    mVtxNext[prev]=next;
+    mVtxPrev[next]=prev;
+    if (mBlossoms[Z].vtxListHead==v) mBlossoms[Z].vtxListHead=next;
+    mVtxBlossom[v]=cNullItm;
+    mVtxPrev[v]=mVtxNext[v]=cNullItm;
+    --mBlossoms[Z].size;
+  }
+  // Only after every member is detached may its links be repurposed.
+  Blossom& C=mBlossoms[id];
+  C.size=vertices.size(); C.rank=logFloor(C.size);
+  VertexId root=vertices[0], prev=vertices[vertices.size()-1];
+  Size minimum=mDepth[root];
+  for (Size i=0; i<vertices.size(); ++i) {
+    const VertexId v=vertices[i];
+    mVtxBlossom[v]=id; mVtxPrev[v]=prev; mVtxNext[prev]=v; prev=v;
+    if (mDepth[v]<minimum) {minimum=mDepth[v];root=v;}
+  }
+  C.rootVertex=root; C.vtxListHead=vertices[0];
+  return id;
+}
+
+inline void BlossomMerging::finish_largest_child_partition(
+    BlossomId Z, VertexId canonicalHead, Size remaining, VertexId minimumRoot)
+{
+  if (!blossom_alive(Z) || remaining==0 || mBlossoms[Z].size!=remaining ||
+      canonicalHead>=mN || minimumRoot>=mN || mVtxBlossom[canonicalHead]!=Z ||
+      mVtxBlossom[minimumRoot]!=Z || mBlossoms[Z].firstPacket!=cNullItm ||
+      mBlossoms[Z].looseHead!=cNullItm || mBlossoms[Z].hHandle!=cNullItm)
+    throw std::runtime_error("largest partition incomplete coverage/cleanup");
+  Blossom& B=mBlossoms[Z];
+  B.rank=logFloor(remaining); B.rootVertex=minimumRoot;
+  B.vtxListHead=canonicalHead; B.active=true;
 }
 
 inline bool BlossomMerging::min_edge(VertexId& outV, VertexId& outW, Val& outCost,
@@ -1446,7 +1681,7 @@ inline BlossomMerging::BlossomId BlossomMerging::merge(BlossomId X, BlossomId Y,
     if (cur == cNullItm) {
       mDedupBestPerB[other] = e;
       touchedB.push_back(other);
-    } else if (E.cost < mEdges[cur].cost) {
+    } else if (edgeLess(e, cur)) {
       ++bmDiscardDedup();
       if (outDiscardedPayloads != NULL)
         outDiscardedPayloads->push_back(mEdges[cur].payload);
@@ -1583,7 +1818,12 @@ inline Size BlossomMerging::validateHeapWalk(EdgeHandle root, BlossomId owner,
     if (expectInPacket && E.packetRank != expectRank)
       BMV_FAIL("CLASS-rank", "e=%lu packetRank=%lu packet.rank=%lu", (unsigned long)e,
                (unsigned long)E.packetRank, (unsigned long)expectRank);
-    if (!ioHave || E.cost < ioMin) { ioMin = E.cost; ioMinE = e; ioHave = true; }
+#ifdef MBX_SHARED_D3_TIE_ORDER
+    if (!std::isfinite(E.cost) || E.tieRank == cNullItm)
+      BMV_FAIL("KEY-invalid", "e=%lu cost=%.17g rank=%lu", (unsigned long)e,
+               (double)E.cost, (unsigned long)E.tieRank);
+#endif
+    if (!ioHave || edgeLess(e, ioMinE)) { ioMin = E.cost; ioMinE = e; ioHave = true; }
     // ---- child chain: link shape + heap order, then descend ----
     EdgeHandle prevSib = cNullItm;
     for (EdgeHandle c = E.phChild; c != cNullItm; c = mEdges[c].phNext) {
@@ -1592,7 +1832,7 @@ inline Size BlossomMerging::validateHeapWalk(EdgeHandle root, BlossomId owner,
       if (mEdges[c].phPrev != expectPrev)
         BMV_FAIL("PH-sibling-links", "child=%lu phPrev=%ld expected=%lu", (unsigned long)c,
                  (long)mEdges[c].phPrev, (unsigned long)expectPrev);
-      if (mEdges[c].inUse && mEdges[c].cost < E.cost)
+      if (mEdges[c].inUse && edgeLess(c, e))
         BMV_FAIL("PH-order", "parent=%lu cost=%.17g child=%lu cost=%.17g", (unsigned long)e,
                  (double)E.cost, (unsigned long)c, (double)mEdges[c].cost);
       stack.push_back(c);
@@ -1662,7 +1902,7 @@ inline Size BlossomMerging::validate(bool paperPure, Size* outStaleClassificatio
   std::vector<BlossomId> edgeOwner(mEdges.size(), cNullItm);
   std::vector<unsigned char> rankSeen(mLogN + 2, 0);
   Size hHandles = 0;
-  bool haveGlobal = false; Val globalMin = 0;
+  bool haveGlobal = false; MinKey globalMin = 0;
   for (BlossomId b = 0; b < mBlossoms.size(); ++b) {
     if (!mBlossoms[b].inUse) continue;
     const Blossom& B = mBlossoms[b];
@@ -1711,10 +1951,10 @@ inline Size BlossomMerging::validate(bool paperPure, Size* outStaleClassificatio
         if (walked != P.count)
           BMV_FAIL("PKT-count", "pk=%lu count=%lu walked=%lu", (unsigned long)pk,
                    (unsigned long)P.count, (unsigned long)walked);
-        if (pHave && mEdges[P.smallestEdge].cost != pMin)
+        if (pHave && edgeKey(P.smallestEdge) != edgeKey(pMinE))
           BMV_FAIL("PKT-min", "pk=%lu rootCost=%.17g walkMin=%.17g", (unsigned long)pk,
                    (double)mEdges[P.smallestEdge].cost, (double)pMin);
-        if (pHave && (!have || pMin < minC)) { minC = pMin; minE = pMinE; have = true; }
+        if (pHave && (!have || edgeLess(pMinE, minE))) { minC = pMin; minE = pMinE; have = true; }
       }
       pk = P.nextInBlossom;
       if (++guard > mPackets.size() + 1) { BMV_FAIL("PKT-list-cycle", "b=%lu", (unsigned long)b); break; }
@@ -1737,6 +1977,12 @@ inline Size BlossomMerging::validate(bool paperPure, Size* outStaleClassificatio
         else if (B.smallestOverall < mEdges.size() && mEdges[B.smallestOverall].cost != minC)
           BMV_FAIL("MIN-handle-cost", "b=%lu handleCost=%.17g min=%.17g", (unsigned long)b,
                    (double)mEdges[B.smallestOverall].cost, (double)minC);
+#ifdef MBX_SHARED_D3_TIE_ORDER
+        if (B.smallestOverall < mEdges.size() && edgeKey(B.smallestOverall) != edgeKey(minE))
+          BMV_FAIL("MIN-rank", "b=%lu cachedRank=%lu recomputedRank=%lu", (unsigned long)b,
+                   (unsigned long)mEdges[B.smallestOverall].tieRank,
+                   (unsigned long)mEdges[minE].tieRank);
+#endif
       }
     }
     // per-blossom H entry
@@ -1746,10 +1992,10 @@ inline Size BlossomMerging::validate(bool paperPure, Size* outStaleClassificatio
         BMV_FAIL("H-missing", "b=%lu active with min=%.17g but no H entry", (unsigned long)b, (double)minC);
       else if (!mH.isActive(B.hHandle))
         BMV_FAIL("H-dead-handle", "b=%lu hHandle=%lu", (unsigned long)b, (unsigned long)B.hHandle);
-      else if (mH.key(B.hHandle) != B.smallestCost)
+      else if (mH.key(B.hHandle) != blossomKey(B))
         BMV_FAIL("H-key", "b=%lu key=%.17g smallestCost=%.17g", (unsigned long)b,
-                 (double)mH.key(B.hHandle), (double)B.smallestCost);
-      if (!haveGlobal || B.smallestCost < globalMin) { globalMin = B.smallestCost; haveGlobal = true; }
+                 (double)keyCost(mH.key(B.hHandle)), (double)B.smallestCost);
+      if (!haveGlobal || blossomKey(B) < globalMin) { globalMin = blossomKey(B); haveGlobal = true; }
     } else {
       if (B.hHandle != cNullItm)
         BMV_FAIL("H-spurious", "b=%lu %s has H entry", (unsigned long)b,
@@ -1787,13 +2033,14 @@ inline Size BlossomMerging::validate(bool paperPure, Size* outStaleClassificatio
     BMV_FAIL("H-size", "live handles=%lu mH.size=%lu", (unsigned long)hHandles, (unsigned long)mH.size());
   if (haveGlobal) {
     if (mH.empty())
-      BMV_FAIL("H-empty", "global min should be %.17g but H empty", (double)globalMin);
+      BMV_FAIL("H-empty", "global min should be %.17g but H empty", (double)keyCost(globalMin));
     else {
       if (mH.minKey() != globalMin)
-        BMV_FAIL("H-globalmin", "H.minKey=%.17g recomputed=%.17g", (double)mH.minKey(), (double)globalMin);
+        BMV_FAIL("H-globalmin", "H.minKey=%.17g recomputed=%.17g", (double)keyCost(mH.minKey()), (double)keyCost(globalMin));
       BlossomId mb = mH.minPayload();
       if (mb >= mBlossoms.size() || !mBlossoms[mb].inUse || !mBlossoms[mb].active
-          || mBlossoms[mb].smallestCost != mH.minKey())
+          || mBlossoms[mb].smallestOverall == cNullItm
+          || blossomKey(mBlossoms[mb]) != mH.minKey())
         BMV_FAIL("H-minpayload", "minPayload=%ld inconsistent", (long)mb);
     }
   } else if (!mH.empty()) {
@@ -1817,6 +2064,86 @@ inline void BlossomMerging::collect_live_edges(std::vector<VertexId>& outV,
   }
 }
 #endif // MBX_BM_VALIDATE
+
+#ifdef MBX_BM_REPLACEMENT_VERIFY
+// Local diagnostic only: expected O(old-ring + child leaves), with scratch
+// proportional to old size, not mN. No global BM scan on each expansion.
+inline void BlossomMerging::verify_frontier_partition(BlossomId Z,
+    const std::vector<const std::vector<VertexId>*>& children) const
+{
+  if (!blossom_alive(Z) || mEdgeRemovalBatchActive || children.empty())
+    throw std::runtime_error("BM replacement: invalid live-super/header/batch");
+  const Blossom& B = mBlossoms[Z];
+  if (B.size == 0 || B.size > mN || B.vtxListHead >= mN ||
+      B.rootVertex >= mN || B.rank != logFloor(B.size))
+    throw std::runtime_error("BM replacement: invalid old ring header");
+  // Independently enumerate the ACTUAL old ring. Owner equality by itself
+  // does not prove ring membership. No n-sized zero array per small expansion.
+  std::unordered_set<VertexId> oldRing;
+  oldRing.reserve(B.size);
+  VertexId cur = B.vtxListHead, minV = cur;
+  for (Size j = 0; j < B.size; ++j) {
+    if (cur >= mN || mVtxBlossom[cur] != Z || !oldRing.insert(cur).second)
+      throw std::runtime_error("BM replacement: old ring bounds/owner/duplicate");
+    const VertexId next = mVtxNext[cur], prev = mVtxPrev[cur];
+    if (next >= mN || prev >= mN || mVtxPrev[next] != cur || mVtxNext[prev] != cur)
+      throw std::runtime_error("BM replacement: old ring broken links");
+    if (mDepth[cur] < mDepth[minV]) minV = cur;
+    cur = next;
+  }
+  if (cur != B.vtxListHead || oldRing.find(B.rootVertex) == oldRing.end())
+    throw std::runtime_error("BM replacement: old ring size/root mismatch");
+  // Consume the separately observed ring identity. erase()==0 catches both
+  // foreign atoms and duplicates (including first-child numeric-ID ABA).
+  Size total = 0;
+  for (Size i = 0; i < children.size(); ++i) {
+    if (children[i] == NULL || children[i]->empty())
+      throw std::runtime_error("BM replacement: empty/null child");
+    const std::vector<VertexId>& members = *children[i];
+    for (Size j = 0; j < members.size(); ++j) {
+      const VertexId v = members[j];
+      if (v >= mN || mVtxBlossom[v] != Z || oldRing.erase(v) != 1)
+        throw std::runtime_error("BM replacement: foreign/duplicate/bounds atom");
+      ++total;
+    }
+  }
+  if (total != B.size || !oldRing.empty())
+    throw std::runtime_error("BM replacement: omitted old-ring atoms");
+}
+
+inline void BlossomMerging::verify_frontier_result(
+    const std::vector<const std::vector<VertexId>*>& children,
+    const std::vector<BlossomId>& ids) const
+{
+  if (children.size() != ids.size() || children.empty() || mEdgeRemovalBatchActive)
+    throw std::runtime_error("BM replacement: incomplete result inventory/batch");
+  std::unordered_set<BlossomId> idSeen;
+  idSeen.reserve(ids.size());
+  for (Size i = 0; i < children.size(); ++i) {
+    if (!blossom_alive(ids[i]) || !idSeen.insert(ids[i]).second ||
+        children[i] == NULL || children[i]->empty())
+      throw std::runtime_error("BM replacement: invalid/repeated child identity");
+    const Blossom& B = mBlossoms[ids[i]];
+    const std::vector<VertexId>& members = *children[i];
+    if (B.size != members.size() || B.vtxListHead != members[0] ||
+        B.rank != logFloor(B.size))
+      throw std::runtime_error("BM replacement: child size/head/rank mismatch");
+    VertexId cur = B.vtxListHead, root = members[0];
+    for (Size j = 0; j < members.size(); ++j) {
+      if (cur >= mN || cur != members[j] || mVtxBlossom[cur] != ids[i])
+        throw std::runtime_error("BM replacement: ordered child ring/owner mismatch");
+      const VertexId prev = members[j == 0 ? members.size() - 1 : j - 1];
+      const VertexId next = members[j + 1 == members.size() ? 0 : j + 1];
+      if (mVtxPrev[cur] != prev || mVtxNext[cur] != next)
+        throw std::runtime_error("BM replacement: child prev/next mismatch");
+      if (mDepth[cur] < mDepth[root]) root = cur;
+      cur = mVtxNext[cur];
+    }
+    if (cur != B.vtxListHead || B.rootVertex != root)
+      throw std::runtime_error("BM replacement: ring end/depth-tie root mismatch");
+  }
+}
+#endif // MBX_BM_REPLACEMENT_VERIFY
 
 } // namespace Matchbox
 

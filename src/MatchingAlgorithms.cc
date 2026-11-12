@@ -1,11 +1,25 @@
 #include "MatchingAlgorithms.h"
 
+// Freeze the validated shared-order/ownership policy for the three-function
+// adapter even when it is compiled without the repository's CMake target.
+#ifndef MBX_SHARED_D3_TIE_ORDER
+#define MBX_SHARED_D3_TIE_ORDER 1
+#endif
+#ifndef MBX_GMG_D3_OWNERSHIP_EXPERIMENT
+#define MBX_GMG_D3_OWNERSHIP_EXPERIMENT 1
+#endif
 #include "classic/MatchingEngine.h"
 
 // This translation unit permanently selects the practical Scaling
 // configuration used for the paper's headline experiments.
 #ifndef SCALING_S5_FULL_KEY_DRIVER_DISABLE
 #define SCALING_S5_FULL_KEY_DRIVER_DISABLE 1
+#endif
+#ifndef SCALING_EVENT_INITIAL_DISSOLUTION_FRONTIER
+#define SCALING_EVENT_INITIAL_DISSOLUTION_FRONTIER 1
+#endif
+#ifndef SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+#define SCALING_ZERO_ROOT_CLEANUP_FRONTIER 1
 #endif
 #include "scaling/ScalingMatching.h"
 

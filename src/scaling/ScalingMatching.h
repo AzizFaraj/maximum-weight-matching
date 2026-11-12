@@ -12,6 +12,23 @@
 #define SCALING_LEAF_NOVEC 1
 #endif
 
+// Opt-in, scan-equivalent discovery of initially INNER non-shell blossoms.
+// Compact event labels already track every node whose search role can be live.
+// Keep the historical sweep as the reference until the frontier has passed
+// differential gates; the verification build compares the exact ordered IDs
+// against that sweep at every fresh non-shell initialization.
+#if defined(SCALING_EVENT_INITIAL_DISSOLUTION_FRONTIER_VERIFY) && \
+    !defined(SCALING_EVENT_INITIAL_DISSOLUTION_FRONTIER)
+#define SCALING_EVENT_INITIAL_DISSOLUTION_FRONTIER
+#endif
+
+// Opt-in current-zero-root cleanup. Keep the exhaustive fixed-point sweep as
+// the reference; VERIFY compares every selected ID and end-of-pass sentinel.
+#if defined(SCALING_ZERO_ROOT_CLEANUP_FRONTIER_VERIFY) && \
+    !defined(SCALING_ZERO_ROOT_CLEANUP_FRONTIER)
+#define SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+#endif
+
 // Select the canonical secondary split-findmin channel before including its
 // implementation. SplitFindmin chooses the dual-key concrete queue from this
 // flag; classical ConcatenableQueue clients retain their single-key layout.
@@ -69,6 +86,7 @@
 // ============================================================================
 
 #include <vector>
+#include <set>
 #include <cassert>
 #include <cstddef>
 #include <algorithm>   // std::reverse, std::swap
@@ -394,7 +412,10 @@ public:
       shellMcmRootFilterNanoseconds(0), shellMcmAuditNanoseconds(0),
       shellDualAdjustmentNanoseconds(0), shellDualVertexVisits(0),
       zeroRootCleanupNanoseconds(0), zeroRootCleanupCalls(0),
-      zeroRootCleanupNodeVisits(0),
+      zeroRootCleanupNodeVisits(0), zeroRootCleanupFrontierCalls(0),
+      zeroRootCleanupOracleChecks(0), zeroRootCleanupOracleNodeVisits(0),
+      zeroRootCleanupPasses(0), zeroRootCleanupDissolutions(0),
+      zeroRootCleanupOrderDigest(0),
       dismantleNanoseconds(0), dismantleChainNanoseconds(0),
       dismantleFreeCountNanoseconds(0), dismantleShellNanoseconds(0),
       dismantleProgressNanoseconds(0), dismantleCalls(0),
@@ -417,6 +438,12 @@ public:
       eventDissolutionResetCandidates(0),
       eventScaleResetCandidates(0),
       eventInitializationFreeCandidates(0), eventInitializationRoots(0),
+      eventInitialDissolutionSearches(0), eventInitialDissolutionNodeVisits(0),
+      eventInitialDissolutionCandidates(0),
+      eventInitialDissolutionFrontierSearches(0),
+      eventInitialDissolutionFullScans(0),
+      eventInitialDissolutionOracleChecks(0),
+      eventInitialDissolutionOracleNodeVisits(0),
       eventFreeCandidateFullScans(0), eventFreeCandidateCacheHits(0),
       eventFreeCandidateVerticesExamined(0),
       eventCriterion2AdjustmentOnlyReturns(0),
@@ -541,6 +568,10 @@ public:
     unsigned long long shellDualAdjustmentNanoseconds, shellDualVertexVisits;
     unsigned long long zeroRootCleanupNanoseconds, zeroRootCleanupCalls;
     unsigned long long zeroRootCleanupNodeVisits;
+    unsigned long long zeroRootCleanupFrontierCalls, zeroRootCleanupPasses;
+    unsigned long long zeroRootCleanupOracleChecks, zeroRootCleanupOracleNodeVisits;
+    unsigned long long zeroRootCleanupDissolutions;
+    unsigned long long zeroRootCleanupOrderDigest;
     unsigned long long dismantleNanoseconds, dismantleChainNanoseconds;
     unsigned long long dismantleFreeCountNanoseconds;
     unsigned long long dismantleShellNanoseconds, dismantleProgressNanoseconds;
@@ -573,6 +604,13 @@ public:
     unsigned long long eventScaleResetCandidates;
     unsigned long long eventInitializationFreeCandidates;
     unsigned long long eventInitializationRoots;
+    unsigned long long eventInitialDissolutionSearches;
+    unsigned long long eventInitialDissolutionNodeVisits;
+    unsigned long long eventInitialDissolutionCandidates;
+    unsigned long long eventInitialDissolutionFrontierSearches;
+    unsigned long long eventInitialDissolutionFullScans;
+    unsigned long long eventInitialDissolutionOracleChecks;
+    unsigned long long eventInitialDissolutionOracleNodeVisits;
     unsigned long long eventFreeCandidateFullScans;
     unsigned long long eventFreeCandidateCacheHits;
     unsigned long long eventFreeCandidateVerticesExamined;
@@ -1211,6 +1249,15 @@ private:
   Size mEventCriterion2FreeScale;
   Size mEventCriterion2FreeUniverse;
   std::vector<Size> mEventInitialRoots;
+#ifdef SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+  // Exactly the active, parentless, raw-z-zero, nonempty current blossoms.
+  // Ordered IDs reproduce each historical ascending fixed-point pass.
+  std::set<Size> mZeroCurrentRoots;
+#endif
+#ifdef SCALING_EVENT_INITIAL_DISSOLUTION_FRONTIER
+  // Reused scratch: filtering does not mutate the compact role frontier.
+  std::vector<Size> mEventInitialDissolutionRoots;
+#endif
   std::vector<BucketPQ::Event> mEventDeferredEdgeEvents;
   std::vector<BucketPQ::Event> mEventBoundaryReuseEvents;
   Size mEventTouchedClock;
@@ -1607,6 +1654,12 @@ private:
   void applyDualTo(LL newTime, LL* tNow);             // advance duals to absolute time
   void beginCompactEventLabels();
   void rememberCompactEventLabel(Size node);
+  bool isInitialDissolutionRoot(Size node) const;
+  void collectInitialDissolutionFrontier(std::vector<Size>* roots) const;
+  bool initialDissolutionFrontierMatchesScan(
+      const std::vector<Size>& roots) const;
+  bool isZeroCurrentRoot(Size node) const;
+  void refreshZeroCurrentRoot(Size node);
 
   // ---- S5 event-driven PERSISTENT engine (paper S5; docs/Scaling_S5_DataStructures.md)
   // Same MWPM result as runPerfectBlossom but NO per-iteration rebuild: the
@@ -1682,6 +1735,115 @@ private:
 
 public:
 #ifdef HYBTEST
+  // Nonempty synthetic frontier gate. Do not infer that the initial INNER
+  // case is impossible merely because many fresh-search fixtures have none.
+  bool hybTestInitialDissolutionFrontier() {
+    mN = 4; mNumNodes = 16;
+    mBParent.assign(mNumNodes, scNull());
+    mNLabel.assign(mNumNodes, LBL_FREE_OF_TREE);
+    mBActive.assign(mNumNodes, 0);
+    mBActive[4] = 1;
+    mOldForestSeparated = true; mAuditOldBegin = 4; mAuditOldEnd = 10;
+    mShellCstar = 6; mShellDstar = 10;
+    const Size odd[] = {2, 4, 6, 8, 9, 10, 13};
+    for (Size i = 0; i < sizeof(odd) / sizeof(odd[0]); ++i)
+      mNLabel[odd[i]] = LBL_ODD;
+    mBParent[8] = 15; // Dormant contracted child, not an INNER root.
+    mNLabel[12] = LBL_EVEN;
+    const Size touched[] = {13, 6, 4, 8, 9, 10, 9, 16, scNull(), 2, 12};
+    mEventTouchedNodes.assign(touched,
+      touched + sizeof(touched) / sizeof(touched[0]));
+    std::vector<Size> roots;
+    collectInitialDissolutionFrontier(&roots);
+    const Size expected[] = {4, 9, 13};
+    if (roots != std::vector<Size>(expected, expected + 3) ||
+        !initialDissolutionFrontierMatchesScan(roots)) return false;
+    // Missing, duplicate, extra, or reordered IDs must fail the exact oracle.
+    roots.erase(roots.begin() + 1);
+    if (initialDissolutionFrontierMatchesScan(roots)) return false;
+    collectInitialDissolutionFrontier(&roots);
+    roots.insert(roots.begin() + 1, 4);
+    if (initialDissolutionFrontierMatchesScan(roots)) return false;
+    collectInitialDissolutionFrontier(&roots);
+    roots.push_back(12);
+    if (initialDissolutionFrontierMatchesScan(roots)) return false;
+    collectInitialDissolutionFrontier(&roots);
+    std::swap(roots[0], roots[1]);
+    return !initialDissolutionFrontierMatchesScan(roots);
+  }
+
+  // A real nested laminar cleanup: larger parents expose lower-ID children,
+  // which must wait until the next ascending pass. Labels intentionally vary.
+  bool hybTestZeroCurrentCleanup(int corruption = 0) {
+    const Size n = 10, cap = 15;
+    mCounters = OperationCounters();
+    mN = n; mNumNodes = cap; mAuditOldEnd = n;
+    mHybridCanonical = true; mHybridReference = false;
+    mEventSearch = true; mBridgeFvr = false; mLazyDuals = false;
+    mEventCompactInitialization = false; mEventStructuresActive = false;
+    mEventSfmInitialized = false;
+    mS5TargetKeyActive = false; mS5TargetKeyTopologyReady = false;
+    mLastStatus = STATUS_SUCCESS;
+    mBParent.assign(cap, scNull()); mBBase.assign(cap, 0);
+    mZ.assign(cap, 0); mBActive.assign(cap, 0);
+    mBCycle.assign(cap, std::vector<Size>());
+    mBCycEdgeU.assign(cap, std::vector<Size>());
+    mBCycEdgeV.assign(cap, std::vector<Size>());
+    mNodeLeaves.assign(cap, std::vector<Size>());
+    mNLabel.assign(cap, LBL_FREE_OF_TREE);
+    mUf.clear(); mBaseToNode.clear();
+    for (Size v = 0; v < n; ++v) {
+      mBBase[v] = v; mNodeLeaves[v].assign(1, v);
+    }
+    const Size c0[] = {0, 1, 2}, c1[] = {10, 3, 4};
+    const Size c2[] = {11, 5, 6}, c3[] = {7, 8, 9};
+    mBCycle[10].assign(c0, c0 + 3); mBCycle[11].assign(c1, c1 + 3);
+    mBCycle[12].assign(c2, c2 + 3); mBCycle[13].assign(c3, c3 + 3);
+    mBBase[13] = 7;
+    for (Size b = 10; b <= 13; ++b) {
+      mBActive[b] = 1;
+      for (Size i = 0; i < mBCycle[b].size(); ++i)
+        mBParent[mBCycle[b][i]] = b;
+    }
+    mNLabel[10] = LBL_EVEN; mNLabel[11] = LBL_ODD;
+#ifdef PS5_LEAF_SPLICE
+    scalingLfInit(n, cap);
+    for (Size b = 10; b <= 13; ++b) scalingLfOnShrink(b);
+#endif
+#ifdef SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+    mZeroCurrentRoots.clear();
+#endif
+    for (Size b = 10; b < cap; ++b) refreshZeroCurrentRoot(b);
+    // Raw dual changes must both remove and reinsert an eligible root.
+    mZ[13] = 2; refreshZeroCurrentRoot(13);
+    mZ[13] = 0; refreshZeroCurrentRoot(13);
+#ifdef SCALING_ZERO_ROOT_CLEANUP_FRONTIER_VERIFY
+    if (corruption == 1) mZeroCurrentRoots.erase(12); // missing next ID
+    if (corruption == 2) mZeroCurrentRoots.insert(14); // inactive extra ID
+#else
+    if (corruption != 0) return false;
+#endif
+    dissolveZeroCurrentRoots();
+    if (corruption != 0)
+      return mLastStatus == STATUS_INVARIANT_VIOLATION &&
+             mCounters.zeroRootCleanupDissolutions == (corruption == 1 ? 0 : 2);
+    unsigned long long expectedDigest = 0;
+    const Size expectedOrder[] = {12, 13, 11, 10};
+    for (Size i = 0; i < 4; ++i)
+      expectedDigest = (expectedDigest ^ (expectedOrder[i] + 1)) * 1099511628211ULL;
+    if (mLastStatus != STATUS_SUCCESS || mCounters.zeroRootCleanupPasses != 4 ||
+        mCounters.zeroRootCleanupDissolutions != 4 ||
+        mCounters.zeroRootCleanupOrderDigest != expectedDigest) return false;
+    for (Size b = 10; b <= 13; ++b)
+      if (mBActive[b] || !mBCycle[b].empty()) return false;
+    for (Size v = 0; v < n; ++v)
+      if (mBParent[v] != scNull()) return false;
+#ifdef SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+    if (!mZeroCurrentRoots.empty()) return false;
+#endif
+    return true;
+  }
+
   void hybTestInitSearchState(const Graph& graph) {
     init(graph);
     Size cap = 2 * mN + 1;
@@ -3264,6 +3426,12 @@ inline void ScalingMatching::init(const Graph& graph) {
   mEventCriterion2FreeScale = scNull();
   mEventCriterion2FreeUniverse = scNull();
   mEventInitialRoots.clear();
+#ifdef SCALING_EVENT_INITIAL_DISSOLUTION_FRONTIER
+  mEventInitialDissolutionRoots.clear();
+#endif
+#ifdef SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+  mZeroCurrentRoots.clear();
+#endif
   mEventDeferredEdgeEvents.clear();
   mEventBoundaryReuseEvents.clear();
   mEventBoundaryReuseReady = false;
@@ -3972,6 +4140,7 @@ inline void ScalingMatching::materializeLazyDuals() {
   for (Size i = 0; i < mLazyActiveNodes.size(); ++i) {
     Size B = mLazyActiveNodes[i];
     mZ[B] = zOf(B);
+    refreshZeroCurrentRoot(B);
   }
   mLazyDuals = false;
 }
@@ -4772,7 +4941,12 @@ inline void ScalingMatching::shrink(Size E, Size W, Size uOrig, Size vOrig) {
     mBCycEdgeV[B].push_back(wV[last]);
   }
   mBBase[B] = mBBase[L];
-  for (Size i = 0; i < mBCycle[B].size(); ++i) mBParent[mBCycle[B][i]] = B;
+  for (Size i = 0; i < mBCycle[B].size(); ++i) {
+    Size child = mBCycle[B][i];
+    mBParent[child] = B;
+    refreshZeroCurrentRoot(child);
+  }
+  refreshZeroCurrentRoot(B);
   // B's leaf set = union of its children's leaf sets (children keep their own,
   // so dissolve restores them for free).
   mNodeLeaves[B].clear();
@@ -5016,6 +5190,7 @@ inline void ScalingMatching::dissolve(Size B) {
 #endif
 #endif
   if (B < mBActive.size()) mBActive[B] = 0;
+  refreshZeroCurrentRoot(B);
 #ifdef PS5_LEAF_SPLICE
   scalingLfOnDissolve(B);
 #endif
@@ -5030,6 +5205,7 @@ inline void ScalingMatching::dissolve(Size B) {
   for (Size i = 0; i < mBCycle[B].size(); ++i) {
     Size child = mBCycle[B][i];
     mBParent[child] = scNull();
+    refreshZeroCurrentRoot(child);
     bool wasDormant = child < mEventDormantFlag.size() &&
                       mEventDormantFlag[child] != 0;
     rememberCompactEventLabel(child);
@@ -6261,6 +6437,7 @@ inline bool ScalingMatching::edmondsSearchEx(int crit, bool maximalAugment,
         if (mShellActive && (b == mShellCstar || b == mShellDstar)) continue;
         if (mNLabel[b] == LBL_EVEN) { mZ[b] += 2 * delta; if (b < mBEverPos.size()) mBEverPos[b] = 1; }
         else if (mNLabel[b] == LBL_ODD) mZ[b] -= 2 * delta;  // bounded by best, stays >=0
+        refreshZeroCurrentRoot(b);
       }
     // HYBRID §4.2 ShellSearch UNIT TRANSLATION of C*/D* (per unit of dual adjustment, so
     // scaled by delta): z(C*)-=2; z(D*)-=2 (if D*); y+=2 on D*, y+=1 on C*\D*. Keeps yz of
@@ -6269,6 +6446,8 @@ inline bool ScalingMatching::edmondsSearchEx(int crit, bool maximalAugment,
     if (mShellActive && !mHybNoTranslate) {
       if (mShellCstar != scNull()) mZ[mShellCstar] -= 2 * delta;
       if (mShellDstar != scNull()) mZ[mShellDstar] -= 2 * delta;
+      refreshZeroCurrentRoot(mShellCstar);
+      refreshZeroCurrentRoot(mShellDstar);
 #ifdef HYBPROF
       if (gHybInDissolve) {
         int parity = -1; Size first = scNull();
@@ -8635,10 +8814,13 @@ inline void ScalingMatching::applyDualTo(LL newTime, LL* tNow) {
     for (Size i = 0; i < mShellNextZNodes.size(); ++i) {
       Size b = mShellNextZNodes[i];
       mZ[b] = mShellNextZ[i];
+      refreshZeroCurrentRoot(b);
       if (mNLabel[b] == LBL_EVEN && b < mBEverPos.size()) mBEverPos[b] = 1;
     }
     mZ[mShellCstar] = nextC;
     if (mShellDstar != scNull()) mZ[mShellDstar] = nextD;
+    refreshZeroCurrentRoot(mShellCstar);
+    refreshZeroCurrentRoot(mShellDstar);
     mCounters.shellDualVertexVisits += mShellMarked.size();
     for (Size i = 0; i < mShellMarked.size(); ++i) {
       Size v = mShellMarked[i];
@@ -8678,8 +8860,10 @@ inline void ScalingMatching::applyDualTo(LL newTime, LL* tNow) {
       for (Size li = 0; li < leaves.size(); ++li)
         mY[leaves[li]] += vertexDelta;
 #endif
-      if (node >= mN)
+      if (node >= mN) {
         mZ[node] += role == LBL_EVEN ? 2 * delta : -2 * delta;
+        refreshZeroCurrentRoot(node);
+      }
     }
     mTNow = newTime;
     *tNow = newTime;
@@ -8694,6 +8878,7 @@ inline void ScalingMatching::applyDualTo(LL newTime, LL* tNow) {
     if (mBParent[b] == scNull()) {
       if (mNLabel[b] == LBL_EVEN) mZ[b] += 2 * delta;
       else if (mNLabel[b] == LBL_ODD) mZ[b] -= 2 * delta;
+      refreshZeroCurrentRoot(b);
     }
   mTNow = newTime;
   *tNow = newTime;
@@ -8747,6 +8932,56 @@ inline void ScalingMatching::beginCompactEventLabels() {
     std::fill(mEventTouchedStamp.begin(), mEventTouchedStamp.end(), 0);
     ++mEventTouchedClock;
   }
+}
+
+inline bool ScalingMatching::isInitialDissolutionRoot(Size b) const {
+  // Exactly the historical scheduler's predicate. In particular, do not add
+  // an active/current-scale restriction: that would change its semantics.
+  return b >= mN && b < mNumNodes && mBParent[b] == scNull() &&
+         mNLabel[b] == LBL_ODD && b != mShellCstar && b != mShellDstar;
+}
+
+inline void ScalingMatching::collectInitialDissolutionFrontier(
+    std::vector<Size>* roots) const {
+  roots->clear();
+  for (Size i = 0; i < mEventTouchedNodes.size(); ++i) {
+    Size b = mEventTouchedNodes[i];
+    if (isInitialDissolutionRoot(b)) roots->push_back(b);
+  }
+  // The full sweep inserted dissolution events in ascending blossom-ID order.
+  // Preserve that order (including equal-time event serials), not touch order.
+  std::sort(roots->begin(), roots->end());
+  roots->erase(std::unique(roots->begin(), roots->end()), roots->end());
+}
+
+inline bool ScalingMatching::initialDissolutionFrontierMatchesScan(
+    const std::vector<Size>& roots) const {
+  Size next = 0;
+  bool matches = true;
+  for (Size b = mN; b < mNumNodes; ++b) {
+    if (!isInitialDissolutionRoot(b)) continue;
+    if (next >= roots.size() || roots[next] != b) matches = false;
+    ++next;
+  }
+  return matches && next == roots.size();
+}
+
+inline bool ScalingMatching::isZeroCurrentRoot(Size b) const {
+  // Use the exact historical cleanup predicate, especially raw mZ rather
+  // than zOf(): materialization remains owned by the existing search lifecycle.
+  return b >= mAuditOldEnd && b < mNumNodes && b < mBParent.size() &&
+         b < mZ.size() && b < mBCycle.size() && b < mBActive.size() &&
+         mBActive[b] && mBParent[b] == scNull() && mZ[b] == 0 &&
+         !mBCycle[b].empty();
+}
+
+inline void ScalingMatching::refreshZeroCurrentRoot(Size b) {
+#ifdef SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+  if (isZeroCurrentRoot(b)) mZeroCurrentRoots.insert(b);
+  else mZeroCurrentRoots.erase(b);
+#else
+  (void)b;
+#endif
 }
 
 inline bool ScalingMatching::edmondsSearchEvent(
@@ -9083,9 +9318,8 @@ inline bool ScalingMatching::edmondsSearchEvent(
   // one inherited phase).  Every live shell root contains a marked shell
   // vertex, so outerOf(marked vertex) is a complete region-local enumeration.
   const auto scheduleInitialDissolution = [&](Size b) -> bool {
-    if (b < mN || b >= mNumNodes || mBParent[b] != scNull() ||
-        mNLabel[b] != LBL_ODD || b == mShellCstar || b == mShellDstar)
-      return true;
+    if (!isInitialDissolutionRoot(b)) return true;
+    ++mCounters.eventInitialDissolutionCandidates;
     // A blossom can already be INNER when a fresh search begins.  Previously
     // only blossoms that entered the INNER role later in this search called
     // sfmShadowBeginInner(), leaving these initial roots at INF and allowing a
@@ -9123,12 +9357,44 @@ inline bool ScalingMatching::edmondsSearchEvent(
       }
     }
   } else {
-    for (Size b = mN; b < mNumNodes; ++b)
-      if (!scheduleInitialDissolution(b)) {
+    ++mCounters.eventInitialDissolutionSearches;
+#ifdef SCALING_EVENT_INITIAL_DISSOLUTION_FRONTIER
+    if (mEventCompactInitialization && mHybridCanonical &&
+        !mHybridReference && mEventSearch && !mBridgeFvr) {
+      ++mCounters.eventInitialDissolutionFrontierSearches;
+      mCounters.eventInitialDissolutionNodeVisits += mEventTouchedNodes.size();
+      collectInitialDissolutionFrontier(&mEventInitialDissolutionRoots);
+#if defined(SCALING_EVENT_INITIAL_DISSOLUTION_FRONTIER_VERIFY) || \
+    defined(SCALING_INVARIANTS)
+      ++mCounters.eventInitialDissolutionOracleChecks;
+      mCounters.eventInitialDissolutionOracleNodeVisits += mNumNodes - mN;
+      if (!initialDissolutionFrontierMatchesScan(mEventInitialDissolutionRoots)) {
+        mLastStatus = STATUS_INVARIANT_VIOLATION;
         materializeLazyDuals();
         mEventStructuresActive = false;
         return false;
       }
+#endif
+      for (Size i = 0; i < mEventInitialDissolutionRoots.size(); ++i)
+        if (!scheduleInitialDissolution(mEventInitialDissolutionRoots[i])) {
+          materializeLazyDuals();
+          mEventStructuresActive = false;
+          return false;
+        }
+    } else
+#endif
+    {
+      // Noncompact initialization does not maintain the role frontier. Keep
+      // the exact historical sweep there, and as the no-flag reference build.
+      ++mCounters.eventInitialDissolutionFullScans;
+      mCounters.eventInitialDissolutionNodeVisits += mNumNodes - mN;
+      for (Size b = mN; b < mNumNodes; ++b)
+        if (!scheduleInitialDissolution(b)) {
+          materializeLazyDuals();
+          mEventStructuresActive = false;
+          return false;
+        }
+    }
   }
   scheduleShellBoundaryEvent(tNow);
   if (mEventUseBinary) mUnboundedPQ.endBatch();
@@ -9849,7 +10115,7 @@ inline bool ScalingMatching::edmondsSearchEvent(
         }
         if (A >= mN) {
           if (mLazyDuals) { tsEnsureNode(A); mZAcc[A] += 2; }
-          else mZ[A] += 2;
+          else { mZ[A] += 2; refreshZeroCurrentRoot(A); }
         }
       }
       Size incomingTarget = mNParEdgeU[A];
@@ -10753,14 +11019,52 @@ inline bool ScalingMatching::resolveOldShellBounds(Size C, Size D, Size pathRoot
 inline void ScalingMatching::dissolveZeroCurrentRoots() {
   ScalingNanosecondGuard cleanupTimer(&mCounters.zeroRootCleanupNanoseconds);
   ++mCounters.zeroRootCleanupCalls;
+#ifdef SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+  const bool useFrontier = mHybridCanonical && !mHybridReference &&
+                           mEventSearch && !mBridgeFvr;
+  if (useFrontier) ++mCounters.zeroRootCleanupFrontierCalls;
+#endif
   bool changed = true; Size guard = 0;
   while (changed && ++guard <= mNumNodes + 2) {
+    ++mCounters.zeroRootCleanupPasses;
     changed = false;
-    for (Size b = mAuditOldEnd; b < mNumNodes; ++b) {
+    Size cursor = mAuditOldEnd;
+    for (;;) {
+      Size b = scNull();
+#ifdef SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+      if (useFrontier) {
+        std::set<Size>::const_iterator next = mZeroCurrentRoots.lower_bound(cursor);
+        if (next != mZeroCurrentRoots.end()) b = *next;
+#if defined(SCALING_ZERO_ROOT_CLEANUP_FRONTIER_VERIFY) || defined(SCALING_INVARIANTS)
+        ++mCounters.zeroRootCleanupOracleChecks;
+        Size exhaustive = scNull();
+        for (Size scan = cursor; scan < mNumNodes; ++scan) {
+          ++mCounters.zeroRootCleanupOracleNodeVisits;
+          if (isZeroCurrentRoot(scan)) { exhaustive = scan; break; }
+        }
+        // Compare the actual next choice, not a frozen pre-pass list: dissolve
+        // can expose another eligible root before this same ascending pass ends.
+        if (b != exhaustive) {
+          mLastStatus = STATUS_INVARIANT_VIOLATION;
+          return;
+        }
+#endif
+        if (b == scNull()) break;
+        mZeroCurrentRoots.erase(b);
+      } else
+#endif
+      {
+        if (cursor >= mNumNodes) break;
+        b = cursor;
+      }
+      // Exposed lower-ID children wait for the next pass, exactly as before.
+      // A higher-ID child remains discoverable in this pass. Never retain an
+      // iterator across dissolve(), which mutates the candidate set.
+      cursor = b + 1;
       ++mCounters.zeroRootCleanupNodeVisits;
-      if (b >= mBParent.size() || b >= mZ.size() || b >= mBCycle.size()) continue;
-      if (b < mBActive.size() && mBActive[b] &&
-          mBParent[b] == scNull() && mZ[b] == 0 && !mBCycle[b].empty()) {
+      if (isZeroCurrentRoot(b)) {
+        mCounters.zeroRootCleanupOrderDigest =
+          (mCounters.zeroRootCleanupOrderDigest ^ (b + 1)) * 1099511628211ULL;
 #ifdef HYBPROF
         if (std::getenv("MBX_TRACE_DPATH"))
           std::fprintf(stderr, "[ZERO-CURRENT-DISSOLVE] B=%lu children=",
@@ -10783,6 +11087,7 @@ inline void ScalingMatching::dissolveZeroCurrentRoots() {
         if (b < mBCycEdgeU.size()) mBCycEdgeU[b].clear();
         if (b < mBCycEdgeV.size()) mBCycEdgeV[b].clear();
         if (b < mNLabel.size()) mNLabel[b] = LBL_FREE_OF_TREE;
+        ++mCounters.zeroRootCleanupDissolutions;
         changed = true;
       }
     }
@@ -11258,6 +11563,7 @@ inline void ScalingMatching::liquidate(Size B) {
   collectBlossomVerts(B, &verts);
   for (Size i = 0; i < verts.size(); ++i) mY[verts[i]] += half;
   mZ[B] = 0;
+  refreshZeroCurrentRoot(B);
   dissolve(B);   // sub-nodes become outer (mBParent -> scNull)
 }
 
@@ -11457,6 +11763,7 @@ inline void ScalingMatching::liquidateInherited(Size B) {
     }
   }
   mZ[B] = 0;
+  refreshZeroCurrentRoot(B);
 }
 
 // Figure 5, step 6.  The member sets were captured before Omega' was
@@ -11605,6 +11912,10 @@ inline bool ScalingMatching::runScaling() {
     mAuditScale = scale;
     mAuditOldBegin = blossomBase;
     mAuditOldEnd = mNumNodes;
+#ifdef SCALING_ZERO_ROOT_CLEANUP_FRONTIER
+    // Every allocated blossom just became inherited; no current ID exists.
+    mZeroCurrentRoots.clear();
+#endif
 #ifdef SCMAG
     { LL ys=0, zs=0; for (Size v=0; v<mN0; ++v) ys+=mY[v]; for (Size b=2*mN0; b<mNumNodes; ++b) zs+=mZ[b];
       Size matched=0; for (Size v=0; v<mN0; ++v) if (mMate[v]!=scNull()) ++matched;
