@@ -1,0 +1,19 @@
+{
+  "schema": "mwm-post-campaign-repairs-v1",
+  "experimental_distribution_commit": "72fd9a7299fa5fad661412789e59aefe22fd4f3f",
+  "experimental_distribution_tag": "hpc-experiments-20261104-v3",
+  "reported_timings_use_repaired_code": false,
+  "repairs": [
+    {
+      "id": "empty-csr-row-pointer-v1",
+      "path": "src/classic/MatchingEngine.h",
+      "baseline_sha256": "92280d1126945315578b84ab13f5236b1cd9bb4cecd912d9c80e547da4129fc2",
+      "repaired_sha256": "b9bb86f6ea9af460ac0e034522c8932b75a3559ece95e545618030abeff7588c",
+      "before": "&mData[mOff[u]]",
+      "after": "mData.data() + mOff[u]",
+      "count": 2,
+      "reason": "Construct valid end pointers for zero-length CSR rows without indexing vector[size()].",
+      "scope": "Mutable and const FlatJagged row-view pointer construction only; no changes to matching policy, weights, or experimental results."
+    }
+  ]
+}

@@ -27,14 +27,49 @@ created. Completed results are documented in this branch's
 required candidate helpers come from the submitted `candidate/` overrides.
 Other private classic/scaling supports come from `frozen/include/`.
 `src/scaling/ScalingMatching.h` is the submitted practical Scaling kernel;
-no new Scaling optimization was made for this distribution.
+no new Scaling optimization was made for this distribution. The classical
+header has the explicitly documented post-campaign repair described below.
 
 Public graph/type/utility headers and `src/Graph.cc` retain submitted bytes.
-The [manifest](tests/kernel_source_manifest.json) records exact source paths
-and hashes; `python3 tests/test_source_identity.py` checks them without the
-cluster. Targeted `.gitattributes` rules preserve historical kernel line
-endings. The adapter, CLI and CMake layout are distribution code, not the
-experiment frontend.
+The unchanged [manifest](tests/kernel_source_manifest.json) records the 35
+experimental source paths and hashes. Of these, 34 still match byte-for-byte;
+one has the allowlisted two-expression repair in
+[post_campaign_repairs.json](tests/post_campaign_repairs.json).
+`python3 tests/test_source_identity.py` requires its repaired hash and reverses
+exactly those two replacements to recover the original byte hash. Other
+changes are rejected. Targeted `.gitattributes` rules preserve historical
+kernel line endings. The adapter, CLI and CMake layout are distribution code,
+not the experiment frontend.
+
+## Post-campaign empty-row repair (2026-11-14)
+
+The exact pre-repair experimental distribution is preserved at annotated tag
+`hpc-experiments-20261104-v3`, commit
+`72fd9a7299fa5fad661412789e59aefe22fd4f3f`. Original HPC packages, campaign
+results, stored weights, and timing tables were not changed by this repair.
+
+The mutable and const classical `FlatJagged` accessors formed a row pointer
+using `&mData[mOff[u]]`. For an empty trailing row backed by a nonempty vector,
+the offset equals `mData.size()`, violating `vector::operator[]`'s bounds
+contract. The repaired expressions use `mData.data() + mOff[u]`, retaining the
+existing empty-storage guard. This permits the intended one-past pointer
+without changing CSR layout, matching policy, weights, or search algorithms.
+Bounds checks are not suppressed. A regression covers isolated vertices and
+completely empty adjacency storage in both classical backends.
+
+The reported campaign timings belong to the preserved experimental code,
+not this repaired revision. Tiny-case checks are correctness/regression
+evidence, not a new performance campaign or a claim that all possible inputs
+are unaffected. The original GitHub sanitizer failure still requires a green
+target-platform rerun; Release success alone does not prove memory safety.
+
+Local repair validation passed all six CTest checks in both Debug (including
+`_GLIBCXX_ASSERTIONS`) and Release with native Windows GCC 13.2. The run used
+the existing empty MinGW `sys/times.h` compatibility include outside this
+repository. This is local regression evidence, not Linux sanitizer evidence.
+The original exact, randomized-brute-force, and 676-vertex tests were retained;
+the new public regression adds ten empty-row fixtures for both classical
+backends. Negative provenance checks reject undeclared or additional edits.
 
 ## Frozen behavior and build
 

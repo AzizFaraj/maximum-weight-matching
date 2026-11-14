@@ -351,7 +351,7 @@ private:
       Size mLen;
     };
     Row operator[](Size u) {
-      return Row(mData.empty() ? (T*)0 : &mData[mOff[u]], mOff[u + 1] - mOff[u]);
+      return Row(mData.empty() ? (T*)0 : mData.data() + mOff[u], mOff[u + 1] - mOff[u]);
     }
     // Read-only row view, for access from const methods.
     class ConstRow {
@@ -364,7 +364,7 @@ private:
       Size mLen;
     };
     ConstRow operator[](Size u) const {
-      return ConstRow(mData.empty() ? (const T*)0 : &mData[mOff[u]],
+      return ConstRow(mData.empty() ? (const T*)0 : mData.data() + mOff[u],
                       mOff[u + 1] - mOff[u]);
     }
   private:

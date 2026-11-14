@@ -20,10 +20,13 @@ private dependencies, not additional public algorithms.
 
 ## Validated baseline and results
 
-The kernels are the sources used by the verified November 2026 HPC campaign,
-including the classical membership repairs, not the subsequently evolving
-development workspace. See [PROVENANCE.md](PROVENANCE.md) and the
-[source-identity manifest](tests/kernel_source_manifest.json).
+The experimental kernels, including the classical membership repairs, are
+preserved at tag `hpc-experiments-20261104-v3` (commit `72fd9a7`). This branch
+adds one post-campaign correctness repair: valid pointer construction for
+empty classical CSR rows. The reported timings were **not** produced by this
+repaired revision. See [PROVENANCE.md](PROVENANCE.md), the unchanged experimental
+[source-identity manifest](tests/kernel_source_manifest.json), and the narrow
+[repair record](tests/post_campaign_repairs.json).
 
 [Results and scope](results/README.md) include all **807 timing runs** on
 **102 instances**, with [readable tables](results/TABLES.md), per-trial data

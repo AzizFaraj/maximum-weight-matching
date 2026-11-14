@@ -31,6 +31,12 @@ target_include_directories(mwm_algorithms
     "${CMAKE_CURRENT_SOURCE_DIR}/src/scaling")
 target_link_libraries(mwm_algorithms PUBLIC OpenMP::OpenMP_CXX)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # Make empty-row/container regressions visible on older libstdc++ too.
+  target_compile_definitions(mwm_algorithms PUBLIC
+    "$<$<CONFIG:Debug>:_GLIBCXX_ASSERTIONS=1>")
+endif()
+
 if(MWM_NATIVE_OPTIMIZATION AND MWM_PAPER_CPU_TARGET)
   message(FATAL_ERROR "Choose only one of MWM_NATIVE_OPTIMIZATION and MWM_PAPER_CPU_TARGET")
 endif()
@@ -68,6 +74,8 @@ if(BUILD_TESTING)
   if(Python3_Interpreter_FOUND)
     add_test(NAME frozen_source_identity
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_source_identity.py")
+    add_test(NAME post_campaign_repair_provenance
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_repair_provenance.py")
   endif()
 
   add_executable(test_exact_algorithms tests/test_exact_algorithms.cc)
@@ -84,10 +92,15 @@ if(BUILD_TESTING)
     COMMAND test_membership_regression
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/membership_regression_676.mtx")
 
+  add_executable(test_empty_rows tests/test_empty_rows.cc)
+  target_link_libraries(test_empty_rows PRIVATE mwm_algorithms)
+  add_test(NAME empty_row_regression COMMAND test_empty_rows)
+
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     # Keep assertion-based correctness gates active in Release builds.
     target_compile_options(test_exact_algorithms PRIVATE -UNDEBUG)
     target_compile_options(test_randomized PRIVATE -UNDEBUG)
     target_compile_options(test_membership_regression PRIVATE -UNDEBUG)
+    target_compile_options(test_empty_rows PRIVATE -UNDEBUG)
   endif()
 endif()
