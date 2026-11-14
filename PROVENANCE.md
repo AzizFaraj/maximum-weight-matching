@@ -60,8 +60,8 @@ completely empty adjacency storage in both classical backends.
 The reported campaign timings belong to the preserved experimental code,
 not this repaired revision. Tiny-case checks are correctness/regression
 evidence, not a new performance campaign or a claim that all possible inputs
-are unaffected. The original GitHub sanitizer failure still requires a green
-target-platform rerun; Release success alone does not prove memory safety.
+are unaffected. The repaired code passed the Linux checks recorded below;
+successful finite tests do not prove safety for every possible input.
 
 Local repair validation passed all six CTest checks in both Debug (including
 `_GLIBCXX_ASSERTIONS`) and Release with native Windows GCC 13.2. The run used
@@ -114,9 +114,23 @@ Standalone Python verifies all 35 frozen source files and the exported
 807-row dataset. The fixed x86-64-v3 Cygwin build compiles, but its randomized
 and membership tests exit with signal 11. This is an unresolved distribution
 check, not a finding that the separately validated Linux/GCC 11.4.1 HPC runs
-failed. No kernel was changed to suppress it. A dedicated Linux fixed-target
-CI job is a required release gate; the cause of the Cygwin failure is not
-established.
+failed. No kernel was changed to suppress it. The cause of the Cygwin failure
+was not established and that platform-specific issue has not been reassessed
+by the later Linux checks.
+
+## Linux validation (2026-11-14)
+
+GitHub Actions CI run #6 for repair commit `28d7fa5` completed successfully.
+All six jobs passed: GCC Debug/Release, Clang Debug/Release, the fixed
+x86-64-v3 paper CPU target, and AddressSanitizer/UndefinedBehaviorSanitizer.
+The run's commit and status were confirmed from the supplied GitHub summary.
+The original randomized test and the added empty-row regressions remain
+enabled; no bounds or sanitizer checks were suppressed.
+
+This validates that code revision's regression suite. Later documentation
+or merge commits have their own CI runs and are not represented as already
+tested merely because their kernel bytes match `28d7fa5`. None of these
+checks reruns or replaces the paper's HPC experiments.
 
 ## Attribution
 
