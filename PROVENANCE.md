@@ -23,6 +23,12 @@ created. Completed results are documented in this branch's
 
 ## Source mapping
 
+The program named `Edmonds` follows the weighted blossom-search organization
+of [Galil, Micali and Gabow (1986)](https://doi.org/10.1137/0215009), with the
+engineering adaptations documented here and in the study.
+[Edmonds (1965)](https://nvlpubs.nist.gov/nistpubs/jres/69B/jresv69Bn1-2p125_A1b.pdf)
+is the foundational weighted-matching reference, not the implementation-specific link.
+
 `src/classic/MatchingEngine.h`, `ConcatenableQueue.h`, `BlossomMerging.h` and
 required candidate helpers come from the submitted `candidate/` overrides.
 Other private classic/scaling supports come from `frozen/include/`.

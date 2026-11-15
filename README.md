@@ -1,6 +1,6 @@
 # Maximum-Weight Matching
 
-C++17 research implementations of [Edmonds][edmonds-paper], [Gabow][gabow-paper]
+C++17 research implementations of [Edmonds (GMG-style)][edmonds-paper], [Gabow][gabow-paper]
 and [Scaling][scaling-paper] for weighted undirected graphs.
 
 Edmonds and Gabow solve maximum-weight matching. Scaling solves maximum-weight
@@ -11,7 +11,7 @@ and Hsin-Hao Su, using a practical search backend with the full-key driver disab
 
 | Algorithm | Public function | Implementation |
 |---|---|---|
-| [Edmonds][edmonds-paper] | `Matchbox::Edmonds` | [MatchingEngine.h](src/classic/MatchingEngine.h) |
+| [Edmonds (GMG-style)][edmonds-paper] | `Matchbox::Edmonds` | [MatchingEngine.h](src/classic/MatchingEngine.h) |
 | [Gabow][gabow-paper] | `Matchbox::Gabow` | [MatchingEngine.h](src/classic/MatchingEngine.h) |
 | [Scaling (Hybrid)][scaling-paper] | `Matchbox::Scaling` | [ScalingMatching.h](src/scaling/ScalingMatching.h) |
 
@@ -57,6 +57,6 @@ and limitations. LEMON was an independent oracle, not a library dependency.
 Derived from [Matchbox](https://github.com/CSCsw/matchbox) under GPL-3.0.
 See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
 
-[edmonds-paper]: https://nvlpubs.nist.gov/nistpubs/jres/69B/jresv69Bn1-2p125_A1b.pdf
+[edmonds-paper]: https://doi.org/10.1137/0215009
 [gabow-paper]: https://arxiv.org/abs/1611.07541
 [scaling-paper]: https://arxiv.org/abs/1411.1919
