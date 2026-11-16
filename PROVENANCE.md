@@ -51,7 +51,7 @@ not the experiment frontend.
 
 The exact pre-repair experimental distribution is preserved at annotated tag
 `hpc-experiments-20261104-v3`, commit
-`72fd9a7299fa5fad661412789e59aefe22fd4f3f`. Original HPC packages, campaign
+`5bd1fabc0ceb9965f841596d99727da35fb63f5e`. Original HPC packages, campaign
 results, stored weights, and timing tables were not changed by this repair.
 
 The mutable and const classical `FlatJagged` accessors formed a row pointer
@@ -126,7 +126,7 @@ by the later Linux checks.
 
 ## Linux validation (2026-11-14)
 
-GitHub Actions CI run #6 for repair commit `28d7fa5` completed successfully.
+GitHub Actions CI run #6 for repair commit `867b63f` (`28d7fa5` before the e-mail change below) completed successfully.
 All six jobs passed: GCC Debug/Release, Clang Debug/Release, the fixed
 x86-64-v3 paper CPU target, and AddressSanitizer/UndefinedBehaviorSanitizer.
 The run's commit and status were confirmed from the supplied GitHub summary.
@@ -135,8 +135,26 @@ enabled; no bounds or sanitizer checks were suppressed.
 
 This validates that code revision's regression suite. Later documentation
 or merge commits have their own CI runs and are not represented as already
-tested merely because their kernel bytes match `28d7fa5`. None of these
+tested merely because their kernel bytes match `867b63f`. None of these
 checks reruns or replaces the paper's HPC experiments.
+
+## Commit IDs (2026-11-16)
+
+On 2026-11-16 the author, committer and tagger e-mail of every commit and of the annotated tag
+was changed. No file changed, but every commit ID did:
+
+| Before | After | Commit |
+|---|---|---|
+| `e21a48c` | `a81dfbb` | Initial research artifact |
+| `7707c57` | `13a847a` | Create production-only solver layout |
+| `369a296` | `ef148e4` | Publish clean Edmonds Gabow and Scaling implementation |
+| `72fd9a7` | `5bd1fab` | Prepare verified HPC kernels and compact November results |
+| `28d7fa5` | `867b63f` | Fix empty CSR row pointer construction without changing experimental snapshot |
+| `4cee257` | `1547e44` | Promote verified artifact while preserving original main history |
+| `eea846f` | `e2e604a` | Simplify README and record successful Linux validation |
+| `6e695ee` | `353d3a4` | Link algorithm papers and identify Hybrid scaling |
+| `e4c1d87` | `ebea56e` | Reference GMG for the engineered Edmonds implementation |
+| `60bdb2d` | `0bfbfba` | Simplify the Scaling introduction in README |
 
 ## Attribution
 

@@ -1,6 +1,6 @@
 {
   "schema": "mwm-post-campaign-repairs-v1",
-  "experimental_distribution_commit": "72fd9a7299fa5fad661412789e59aefe22fd4f3f",
+  "experimental_distribution_commit": "5bd1fabc0ceb9965f841596d99727da35fb63f5e",
   "experimental_distribution_tag": "hpc-experiments-20261104-v3",
   "reported_timings_use_repaired_code": false,
   "repairs": [
