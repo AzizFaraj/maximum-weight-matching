@@ -3,9 +3,9 @@
 C++17 research implementations of [Edmonds (GMG-style)][edmonds-paper], [Gabow][gabow-paper]
 and [Scaling][scaling-paper] for weighted undirected graphs.
 
-Edmonds and Gabow solve maximum-weight matching. Scaling solves maximum-weight
-perfect matching: it implements the Hybrid algorithm of Ran Duan, Seth Pettie
-and Hsin-Hao Su, using a practical search backend with the full-key driver disabled.
+Edmonds and Gabow solve maximum-weight matching. Scaling implements the Hybrid
+algorithm of Ran Duan, Seth Pettie and Hsin-Hao Su for maximum-weight perfect
+matching.
 
 ## Code
 
