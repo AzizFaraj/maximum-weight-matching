@@ -1,0 +1,34 @@
+{
+  "upload_type": "software",
+  "title": "maximum-weight-matching: Edmonds, Gabow and Scaling implementations with experimental data",
+  "description": "<p>C++17 implementations of three exact maximum weighted matching algorithms for general graphs: Edmonds' algorithm organized as in Galil, Micali and Gabow (1986); Gabow's supporting forest and tree-blossom merging (2018); and the Hybrid scaling algorithm of Duan, Pettie and Su (2018). The repository also holds the per-trial records of the experiments reported in <em>An Experimental Evaluation of Maximum Weighted Matching Algorithms: Edmonds, Gabow, and Scaling on General Graphs</em> by Abdulaziz Alfaraj and Ahmed Al-Herz.</p>",
+  "creators": [
+    {
+      "name": "Alfaraj, Abdulaziz",
+      "affiliation": "King Fahd University of Petroleum and Minerals",
+      "orcid": "0009-0003-7714-0052"
+    },
+    {
+      "name": "Al-Herz, Ahmed",
+      "affiliation": "King Fahd University of Petroleum and Minerals"
+    }
+  ],
+  "access_right": "open",
+  "license": "gpl-3.0-only",
+  "keywords": [
+    "maximum weighted matching",
+    "blossom algorithm",
+    "Gabow's data structures",
+    "weight scaling",
+    "algorithm engineering",
+    "experimental algorithmics"
+  ],
+  "language": "eng",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/CSCsw/matchbox",
+      "relation": "isDerivedFrom",
+      "resource_type": "software"
+    }
+  ]
+}
